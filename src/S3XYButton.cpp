@@ -60,19 +60,20 @@ static inline void notifyBytes(const uint8_t* data, size_t len) {
 }
 
 // ---- Callbacks for BLE (internal) ----
-class SecCB : public BLESecurityCallbacks {
-  uint32_t onPassKeyRequest() override {
-    return 0;
-  }
+class SharedSecurityCB : public BLESecurityCallbacks {
+  uint32_t onPassKeyRequest() override { return 0; }
   void onPassKeyNotify(uint32_t) override {}
-  bool onSecurityRequest() override {
-    return true;
-  }
-  bool onConfirmPIN(uint32_t) override {
-    return true;
-  }
+  bool onSecurityRequest() override { return true; }
+  bool onConfirmPIN(uint32_t) override { return true; }
+  
   void onAuthenticationComplete(ble_gap_conn_desc* desc) override {
-    S3XY_LOG(desc->sec_state.bonded ? "Bonded" : "Bond failed");
+    if (desc->role == BLE_GAP_ROLE_SLAVE) {
+      S3XY_LOG(desc->sec_state.bonded ? "Commander Bonded" : "Commander Bond Failed");
+    } else if (desc->role == BLE_GAP_ROLE_MASTER) {
+      S3XY_LOG(desc->sec_state.bonded ? "Stalk Bonded" : "Stalk Bond Failed");
+    } else {
+      S3XY_LOGF("Unknown role %u, bonded: %d)\n", (unsigned)desc->role, desc->sec_state.bonded);
+    }
   }
 };
 
@@ -139,7 +140,7 @@ void s3xy_begin(const char* deviceName) {
 
   BLEDevice::init(deviceName ? deviceName : "ENH_BTN");
 
-  static SecCB sec;
+  static SharedSecurityCB sec;
   // BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT); // removed in arduino code 3.x
   BLEDevice::setSecurityCallbacks(&sec);
 

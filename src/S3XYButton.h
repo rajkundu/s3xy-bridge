@@ -1,6 +1,12 @@
 #pragma once
 #include <stdint.h>
 
+enum class S3XYButtonAction : uint8_t {
+  Single,
+  Double,
+  Long,
+};
+
 // Init as spoofed button. Optional custom name.
 void s3xy_begin(const char* deviceName = "ENH_BTN");
 
