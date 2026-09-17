@@ -71,8 +71,8 @@ class SecCB : public BLESecurityCallbacks {
   bool onConfirmPIN(uint32_t) override {
     return true;
   }
-  void onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) override {
-    S3XY_LOG(cmpl.success ? "Bonded" : "Bond failed");
+  void onAuthenticationComplete(ble_gap_conn_desc* desc) override {
+    S3XY_LOG(desc->sec_state.bonded ? "Bonded" : "Bond failed");
   }
 };
 
@@ -93,12 +93,10 @@ class ServerCB : public BLEServerCallbacks {
   }
 };
 
-class CccdCB : public BLEDescriptorCallbacks {
-  void onWrite(BLEDescriptor* d) override {
-    uint8_t* value = d->getValue();
-    size_t len = d->getLength();
-
-    g_subscribed = len >= 1 && (value[0] & 0x01);
+class NotifyCB : public BLECharacteristicCallbacks {
+  void onSubscribe(BLECharacteristic* pChar, ble_gap_conn_desc* desc, uint16_t subValue) override {
+    // subValue: 0 = Unsubscribed, 1 = Notifications enabled, 2 = Indications enabled
+    g_subscribed = (subValue == 1);
     S3XY_LOG(g_subscribed ? "Notifications enabled" : "Notifications disabled");
   }
 };
@@ -142,7 +140,7 @@ void s3xy_begin(const char* deviceName) {
   BLEDevice::init(deviceName ? deviceName : "ENH_BTN");
 
   static SecCB sec;
-  BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
+  // BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT); // removed in arduino code 3.x
   BLEDevice::setSecurityCallbacks(&sec);
 
   auto* pSec = new BLESecurity();
@@ -159,14 +157,16 @@ void s3xy_begin(const char* deviceName) {
 
   g_notify = svc->createCharacteristic(CHAR_NOTIFY_UUID,
                                        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-  auto* cccd = new BLE2902();
-  cccd->setNotifications(false);
-  cccd->setCallbacks(new CccdCB());
-  g_notify->addDescriptor(cccd);
+
+  g_notify->setCallbacks(new NotifyCB());
   g_notify->setValue((uint8_t*)"\x00", 1);
 
-  g_id = svc->createCharacteristic(CHAR_ID_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
-  g_id->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED | ESP_GATT_PERM_WRITE_ENCRYPTED);
+  g_id = svc->createCharacteristic(CHAR_ID_UUID, 
+    BLECharacteristic::PROPERTY_READ | 
+    BLECharacteristic::PROPERTY_WRITE | 
+    BLECharacteristic::PROPERTY_READ_ENC | 
+    BLECharacteristic::PROPERTY_WRITE_ENC
+  );
   g_id->setValue(g_buttonId, sizeof(g_buttonId));
   g_id->setCallbacks(new IDCB());
 
