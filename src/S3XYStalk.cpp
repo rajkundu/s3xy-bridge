@@ -155,31 +155,48 @@ class StalkClientCallbacks : public BLEClientCallbacks {
 // Find the stalk
 // ============================================================
 
+class SavedStalkCallbacks : public BLEAdvertisedDeviceCallbacks {
+ public:
+  explicit SavedStalkCallbacks(const char* address) : address_(address) {}
+
+  void onResult(BLEAdvertisedDevice advertisedDevice) override {
+    if (advertisedDevice.getAddress().toString() != address_) {
+      return;
+    }
+
+    Serial.println("[stalk] *** Found saved stalk MAC ***");
+    result_ = new BLEAdvertisedDevice(advertisedDevice);
+    BLEDevice::getScan()->stop();
+  }
+
+  BLEAdvertisedDevice* result() const {
+    return result_;
+  }
+
+ private:
+  String address_;
+  BLEAdvertisedDevice* result_ = nullptr;
+};
+
 static BLEAdvertisedDevice* findStalkByAddress(const char* address) {
   BLEScan* scan = BLEDevice::getScan();
 
-  scan->setActiveScan(true);
+  // Passive scan is enough when looking for a known MAC
+  scan->setActiveScan(false); 
   scan->setInterval(100);
-  scan->setWindow(80);
+  scan->setWindow(100);
 
   Serial.printf("[stalk] Looking for saved stalk MAC %s\n", address);
 
-  BLEScanResults* results = scan->start(3, false);
+  SavedStalkCallbacks callbacks(address);
+  scan->setAdvertisedDeviceCallbacks(&callbacks);
 
-  BLEAdvertisedDevice* result = nullptr;
+  // Blocks for max 5 seconds; exits instantly if callbacks call stop()
+  scan->start(5, false);
 
-  for (int i = 0; i < results->getCount(); ++i) {
-    BLEAdvertisedDevice device = results->getDevice(i);
-
-    if (device.getAddress().toString() == String(address)) {
-      Serial.println("[stalk] *** Found saved stalk MAC ***");
-      result = new BLEAdvertisedDevice(device);
-      break;
-    }
-  }
-
+  scan->setAdvertisedDeviceCallbacks(nullptr);
   scan->clearResults();
-  return result;
+  return callbacks.result();
 }
 
 static BLEAdvertisedDevice* findStalk() {
@@ -187,10 +204,11 @@ static BLEAdvertisedDevice* findStalk() {
 
   scan->setActiveScan(true);
   scan->setInterval(100);
-  scan->setWindow(80);
+  scan->setWindow(100);
 
   Serial.println("[stalk] Scanning...");
 
+  // Scan up to 5 sec to catch a sleeping stalk's slow background advertisements
   BLEScanResults* results = scan->start(5, false);
 
   BLEAdvertisedDevice* result = nullptr;
@@ -400,10 +418,12 @@ void s3xy_stalk_loop() {
   if (millis() < g_nextScanTime)
     return;
 
-  g_nextScanTime = millis() + 5000;
-
+  // Backoff timer
   if (!connectToStalk()) {
-    Serial.println("[stalk] Will retry...");
+    Serial.println("[stalk] Not found. Will retry in 5 seconds...");
+    g_nextScanTime = millis() + 5000;
+  } else {
+    g_nextScanTime = millis();
   }
 }
 
