@@ -11,8 +11,7 @@
 // S3XY Left Stalk
 // ============================================================
 
-static const char* STALK_NAME =
-    "ENH_STLK_L";
+static const char* STALK_NAME = "ENH_STLK_L";
 
 static const char* STALK_SERVICE_UUID = "00003D69-87D2-479E-7E45-8551415A6DE1";
 static const char* STALK_NOTIFY_UUID = "00003D50-87D2-479E-7E45-8551415A6DE1";
@@ -155,18 +154,44 @@ class StalkClientCallbacks : public BLEClientCallbacks {
 // Find the stalk
 // ============================================================
 
-class SavedStalkCallbacks : public BLEAdvertisedDeviceCallbacks {
+class StalkLocatorCallbacks : public BLEAdvertisedDeviceCallbacks {
  public:
-  explicit SavedStalkCallbacks(const char* address) : address_(address) {}
+  explicit StalkLocatorCallbacks(const char* targetAddress = nullptr) {
+    if (targetAddress) {
+      address_ = targetAddress;
+      searchByMac_ = true;
+    } else {
+      searchByMac_ = false;
+    }
+  }
 
   void onResult(BLEAdvertisedDevice advertisedDevice) override {
-    if (advertisedDevice.getAddress().toString() != address_) {
-      return;
+    bool match = false;
+
+    if (searchByMac_) {
+      match = (advertisedDevice.getAddress().toString() == address_);
+    } else {
+      bool nameMatches =
+          advertisedDevice.haveName() &&
+          advertisedDevice.getName() == STALK_NAME;
+
+      bool serviceMatches =
+          advertisedDevice.haveServiceUUID() &&
+          advertisedDevice.isAdvertisingService(BLEUUID(STALK_SERVICE_UUID));
+
+      match = (nameMatches || serviceMatches);
     }
 
-    Serial.println("[stalk] *** Found saved stalk MAC ***");
-    result_ = new BLEAdvertisedDevice(advertisedDevice);
-    BLEDevice::getScan()->stop();
+    if (match) {
+      if (searchByMac_) {
+        Serial.println("[stalk] *** Found stalk by saved MAC ***");
+      } else {
+        Serial.println("[stalk] *** Found stalk by name & service UUID ***");
+      }
+      
+      result_ = new BLEAdvertisedDevice(advertisedDevice);
+      BLEDevice::getScan()->stop(); // Early exit!
+    }
   }
 
   BLEAdvertisedDevice* result() const {
@@ -175,6 +200,7 @@ class SavedStalkCallbacks : public BLEAdvertisedDeviceCallbacks {
 
  private:
   String address_;
+  bool searchByMac_;
   BLEAdvertisedDevice* result_ = nullptr;
 };
 
@@ -184,11 +210,11 @@ static BLEAdvertisedDevice* findStalkByAddress(const char* address) {
   // Passive scan is enough when looking for a known MAC
   scan->setActiveScan(false); 
   scan->setInterval(100);
-  scan->setWindow(100);
+  scan->setWindow(80); // 80% duty cycle
 
   Serial.printf("[stalk] Looking for saved stalk MAC %s\n", address);
 
-  SavedStalkCallbacks callbacks(address);
+  StalkLocatorCallbacks callbacks(address);
   scan->setAdvertisedDeviceCallbacks(&callbacks);
 
   // Blocks for max 5 seconds; exits instantly if callbacks call stop()
@@ -204,43 +230,20 @@ static BLEAdvertisedDevice* findStalk() {
 
   scan->setActiveScan(true);
   scan->setInterval(100);
-  scan->setWindow(100);
+  scan->setWindow(80); // 80% duty cycle
 
   Serial.println("[stalk] Scanning...");
 
+  StalkLocatorCallbacks callbacks;
+  scan->setAdvertisedDeviceCallbacks(&callbacks);
+
   // Scan up to 5 sec to catch a sleeping stalk's slow background advertisements
-  BLEScanResults* results = scan->start(5, false);
+  scan->start(5, false);
 
-  BLEAdvertisedDevice* result = nullptr;
-
-  for (int i = 0; i < results->getCount(); ++i) {
-
-    BLEAdvertisedDevice device = results->getDevice(i);
-
-    bool nameMatches =
-        device.haveName() &&
-        device.getName() == STALK_NAME;
-
-    bool serviceMatches =
-        device.haveServiceUUID() &&
-        device.isAdvertisingService(
-            BLEUUID(STALK_SERVICE_UUID)
-        );
-
-    if (nameMatches || serviceMatches) {
-
-      Serial.println("[stalk] *** Found target stalk ***");
-
-      // connect() wants a BLEAdvertisedDevice*,
-      // so create a persistent copy.
-      result = new BLEAdvertisedDevice(device);
-      break;
-    }
-  }
-
+  scan->setAdvertisedDeviceCallbacks(nullptr);
   scan->clearResults();
 
-  return result;
+  return callbacks.result();
 }
 
 // ============================================================
