@@ -275,10 +275,16 @@ static bool connectToStalk() {
 
   // A scan can still be completing internally when start() returns. Stop it
   // explicitly before asking NimBLE to create a connection.
+  uint32_t stageStartedAt = millis();
   BLEDevice::getScan()->stop();
   delay(200);
+  Serial.printf("[stalk] scan shutdown took %lu ms\n",
+                millis() - stageStartedAt);
 
+  stageStartedAt = millis();
   g_client = BLEDevice::createClient();
+  Serial.printf("[stalk] create client took %lu ms\n",
+                millis() - stageStartedAt);
 
   if (!g_client) {
     Serial.println("[stalk] Failed to create BLE client");
@@ -290,7 +296,12 @@ static bool connectToStalk() {
       new StalkClientCallbacks()
   );
 
-  if (!g_client->connect(device)) {
+  stageStartedAt = millis();
+  bool connected = g_client->connect(device);
+  Serial.printf("[stalk] connect/bond took %lu ms\n",
+                millis() - stageStartedAt);
+
+  if (!connected) {
     Serial.println("[stalk] Connection failed");
 
     delete device;
@@ -304,10 +315,13 @@ static bool connectToStalk() {
   // Find service
   // ----------------------------------------------------------
 
-  g_service =
+    stageStartedAt = millis();
+    g_service =
       g_client->getService(
           BLEUUID(STALK_SERVICE_UUID)
       );
+    Serial.printf("[stalk] service discovery took %lu ms\n",
+          millis() - stageStartedAt);
 
   if (!g_service) {
     Serial.println(
@@ -322,9 +336,12 @@ static bool connectToStalk() {
 
   Serial.println("[stalk] Found service 3D69");
 
+  stageStartedAt = millis();
   g_notifyChar = g_service->getCharacteristic(
       BLEUUID(STALK_NOTIFY_UUID)
   );
+  Serial.printf("[stalk] notify characteristic lookup took %lu ms\n",
+                millis() - stageStartedAt);
 
   if (!g_notifyChar) {
     Serial.println(
@@ -358,18 +375,24 @@ static bool connectToStalk() {
 
   Serial.println("[stalk] Registering for notifications...");
 
+  stageStartedAt = millis();
   g_notifyChar->registerForNotify(
       stalkNotifyCallback,
       true,
       true
   );
+  Serial.printf("[stalk] notification registration took %lu ms\n",
+                millis() - stageStartedAt);
   g_notificationsSubscribed = true;
 
   Serial.println("[stalk] Notification subscription registered");
 
+  stageStartedAt = millis();
   g_idChar = g_service->getCharacteristic(
       BLEUUID(STALK_ID_UUID)
   );
+  Serial.printf("[stalk] ID characteristic lookup took %lu ms\n",
+                millis() - stageStartedAt);
 
   if (!g_idChar ||
       (!g_idChar->canWrite() && !g_idChar->canWriteNoResponse())) {

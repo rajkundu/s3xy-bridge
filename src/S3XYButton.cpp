@@ -67,6 +67,16 @@ class SharedSecurityCB : public BLESecurityCallbacks {
   bool onConfirmPIN(uint32_t) override { return true; }
   
   void onAuthenticationComplete(ble_gap_conn_desc* desc) override {
+    Serial.printf(
+        "[ble] authentication complete: role=%u handle=%u bonded=%u "
+        "encrypted=%u authenticated=%u key_size=%u\n",
+        static_cast<unsigned>(desc->role),
+        desc->conn_handle,
+        desc->sec_state.bonded,
+        desc->sec_state.encrypted,
+        desc->sec_state.authenticated,
+        desc->sec_state.key_size);
+
     if (desc->role == BLE_GAP_ROLE_SLAVE) {
       S3XY_LOG(desc->sec_state.bonded ? "Commander Bonded" : "Commander Bond Failed");
     } else if (desc->role == BLE_GAP_ROLE_MASTER) {
