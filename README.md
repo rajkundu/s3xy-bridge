@@ -1,95 +1,46 @@
-# 🟢 S3XY Virtual Button (ESP32)
+# S3XY Bridge (ESP32)
 
-This is a simple ESP32 sketch that turns your dev board into a virtual *S3XY Button* — a BLE accessory that mimics Enhance Auto’s real button (`ENH_BTN`) device.
+This is an ESP32 sketch that simultaneously:
+1. Acts as a Commander/BLE Central for a S3XY Stalk, and
+2. Virtualizes a S3XY Button thanks to [this](https://github.com/Beat-YT/s3xy-virtual-button) repo
 
-You can:
-- Pair it with your Tesla Gen 2 S3XY Commander
-- Emulate single click, long press, or double click actions
-- Add your own automation logic easily in `main.cpp`
+## What This Does
 
-> ⚠️ All BLE, pairing, and hex protocol details are abstracted away. You only deal with simple functions like `s3xy_send_single()` — ideal for beginners or tinkerers.
+My main goal was to talk to a S3XY Stalk just like a S3XY Commander does. This way, I could customize its exact behavior upon press/release/hold. Thankfully, the Stalk is set up as a straightforward BLE peripheral, so any BLE Central can talk to it easily.
 
----
+For my specific use case, I also virtualize a S3XY Button for triggering CAN bus functions via S3XY Commander/app. In particular, I wanted to customize the behavior of the stalk based on how long it was pressed down, and I also wanted to assign functions upon press & release.
 
-## 📦 Why I Made This
+## Bluetooth Protocol Information
 
-One night I got fed up with the S3XY Commander and expensive buttons.  
-I wanted automation. Triggers. Scripts. Control.
+The following was derived from playing around with nRF Connect on an iPhone and LightBlue on macOS:
 
-Instead, I got a blinking LED and manual presses.
+- Local Name: ENH_STLK_L
+- Service UUID: 00003D69-87D2-479E-7E45-8551415A6DE1
+- Characteristic 1 UUID (Switches/Notify): 00003D50-87D2-479E-7E45-8551415A6DE1
+- Characteristic 2 UUID ("ID"): 00003D49-87D2-479E-7E45-8551415A6DE1
 
-So I reverse-engineered it.
+**Stalk End-Cap Button**
+- On Press: 0xA101
+- On Release: 0xA100
+- Single Press: 0xA1C101
+- Double Press: 0xA1C102
+- Long Press: 0xA1C301
 
-In a day.
+**Stalk "Up" Switch**
+- On Press: 0xA301
+- On Release: 0xA300
+- Single Press: 0xA3C101
+- Double Press: 0xA3C102
+- Long Press: 0xA3C301
 
-This repo is the result.
+**Stalk "Down" Switch**
+- On Press: 0xA201
+- On Release: 0xA200
+- Single Press: 0xA2C101
+- Double Press: 0xA2C102
+- Long Press: 0xA2C301
 
----
+## Note
+I would NOT consider this code production-quality. It is somewhat modular, but many improvements can be made to make it more abstracted & object-oriented.
 
-## 🔍 What It Does
-
-The official S3XY Button is a BLE peripheral called `ENH_BTN`.  
-When paired with the S3XY Commander (an ESP32-based receiver), it uses encrypted GATT notifications to trigger button actions.  
-
-This project:
-- Spoofs the button (same name, same UUIDs)
-- Pairs securely with your Commander
-- Responds to specific write commands
-- Sends the correct BLE notify packets on demand
-
-**Also:**  
-The real button adds a ~300 ms delay before processing clicks when multiple actions (like double-click or long-press) are configured — likely to wait and see what you're doing.  
-This version sends actions **instantly**. No lag. No guessing.
-
-And yes, it’s fully compatible with the gen2 commander. Tested.
-
-## 🔧 Pairing Procedure (Same as Real Button)
-
-> 🆕 **Note:** The virtual button automatically enters pairing mode on power-up.
-
-To pair it:
-1. Power up your ESP32 running this sketch
-2. It advertises as `ENH_BTN` and waits for a connection
-3. On the S3XY Commander, go to the **Buttons menu → Add S3XY Button**
-4. It will detect and bond with your ESP32 automatically
-5. Once paired, the Commander will start sending encrypted BLE commands to your virtual button
-
-You can now trigger `s3xy_send_single()` to activate accessories — exactly like the real hardware.
-
----
-
-## 🔐 Security / Protocol Details
-
-The Commander uses BLE Secure Connections with bonding (just like a real accessory would):
-- 16-byte encryption key
-- No passkey (Just Works pairing)
-- Authentication level: `ESP_LE_AUTH_REQ_SC_BOND`
-- Key exchange uses `ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK`
-
-Once bonded, the Commander can securely read/write to the "ID" characteristic and subscribe to button notifications.
-
-> 📝 "ID" isn't some official name — it's just what I called the `0x3d49` characteristic UUID.  
-> The Commander writes to it to interact with the button — sending things like handshake checks, rename commands, and disconnect requests.
-
-This sketch emulates the real button behavior:
-- When the Commander writes `0xB6`, it replies with `C7 00 01` (firmware/version check?)
-- When it writes `0xA1`, we disconnect (unpair)
-- When it writes `A4 XX YY ZZ`, we send a rename response (used for S - E - X - Y button tags?)
-
-All UUIDs and byte patterns were captured and decoded from real ENH_BTN ↔ Commander traffic.
-
-> 🧪 Sniffing BLE traffic was done with nRF Connect + a rooted Android phone + wireshark
-
-
-## 💡 Usage
-
-Start with the provided `main.cpp` in the `src` folder. It's your playground.
-
-```cpp
-s3xy_on_connect(onConnected);       // your own LED blink, sound, etc
-s3xy_on_disconnect(onDisconnected);
-
-s3xy_send_single();                 // simulates tap (instant!)
-s3xy_send_long();                   // simulates hold
-s3xy_send_double();                 // simulates double tap
-```
+This code is probably best used by having an LLM harvest the parts you want. Refer to [BeatYT's s3xy-virtual-button repo](github.com/Beat-YT/s3xy-virtual-button) for more detailed information on the S3XY Button's Bluetooth handshake, protocols, etc.
