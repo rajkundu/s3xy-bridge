@@ -1,155 +1,139 @@
-#include <Arduino.h>
+#include "NimBLEDevice.h"
+#include "nvs_flash.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "compat.h"
 #include "S3XYButton.h"
-#include "S3XYStalk.h"
+#include "S3XYDeviceManager.h"
+#include "S3XYDeviceProfile.h"
 #include "S3XYStalkInput.h"
 #include "Led.h"
 
-Led led(LED_BUILTIN);
+static const char* TAG = "main";
 
-static bool serialInputToAction(char input, S3XYButtonAction* action) {
-  if (input == 's') {
-    *action = S3XYButtonAction::Single;
-    return true;
-  }
-  if (input == 'd') {
-    *action = S3XYButtonAction::Double;
-    return true;
-  }
-  if (input == 'l') {
-    *action = S3XYButtonAction::Long;
-    return true;
-  }
-  return false;
-}
+// On ESP32-C6-SuperMini, the onboard LED is GPIO 8
+static constexpr gpio_num_t LED_PIN = GPIO_NUM_8;
 
-static bool executeButtonAction(S3XYButtonAction action) {
-  if (!s3xy_ready()) {
-    Serial.println("[main] button action ignored: button is not ready");
-    return false;
-  }
+Led led(LED_PIN);
 
-  if (action == S3XYButtonAction::Single) {
-    s3xy_send_single();
-    led.runLed({
-      {0, false},
-      {100, true}
-    }, 0);
-    Serial.println("Sent single press");
-  } else if (action == S3XYButtonAction::Double) {
-    s3xy_send_double();
-    led.runLed({
-      {0, false},
-      {100, true},
-      {200, false},
-      {300, true}
-    }, 0);
-    Serial.println("Sent double press");
-  } else if (action == S3XYButtonAction::Long) {
-    s3xy_send_long();
-    led.runLed({
-      {0, false},
-      {500, true}
-    }, 0);
-    Serial.println("Sent long press");
-  }
+// ----- Notification callbacks -----
 
-  return true;
-}
-
-static void processQueuedButtonActions() {
-  S3XYButtonAction action;
-
-  while (s3xy_stalk_input_dequeue_action(&action)) {
-    executeButtonAction(action);
-  }
-}
-
-void onButtonConnected() {
-  Serial.println("[button] connected");
-}
-
-void onButtonDisconnected() {
-  Serial.println("[button] disconnected");
-}
-
-void onStalkNotify(const uint8_t* data, size_t len) {
+static void onStalkNotify(const uint8_t* data, size_t len) {
   s3xy_stalk_input_handle_notify(data, len);
 }
 
-void setup() {
-  // Set up BLE peripheral/virtual button
-  s3xy_on_connect(onButtonConnected);
-  s3xy_on_disconnect(onButtonDisconnected);
-  s3xy_begin("ENH_BTN");
-
-  // Set up BLE central/stalk
-  s3xy_stalk_on_notify(onStalkNotify);
-  s3xy_stalk_begin();
-
-  // Set up LED
-  led.begin();
+static void onButtonNotify(const uint8_t* data, size_t len) {
+  ESP_LOGI("btn_notify", "RX %u bytes", (unsigned)len);
+  ESP_LOG_BUFFER_HEX("btn_notify", data, len);
 }
 
-void loop() {
-  s3xy_loop();
+// ----- Device profiles -----
 
-  static int previousReadyState = -1;
-  int readyState = (s3xy_ready() ? 1 : 0) |
-                   (s3xy_stalk_ready() ? 2 : 0);
-  if (readyState != previousReadyState) {
-    Serial.printf("[main] readiness state changed to %d (button=%d, stalk=%d)\n",
-                  readyState, s3xy_ready(), s3xy_stalk_ready());
-    previousReadyState = readyState;
-  }
+static const S3XYDeviceProfile PROFILES[] = {
+  {"ENH_STLK",
+   "00003D69-87D2-479E-7E45-8551415A6DE1",
+   "00003D50-87D2-479E-7E45-8551415A6DE1",
+   "00003D49-87D2-479E-7E45-8551415A6DE1",
+   "stalk", onStalkNotify},
 
-  // neither ready
-  if (!s3xy_ready() && !s3xy_stalk_ready()) {
-    if (!led.isRunning() || led.isRepeating()) {
-      led.runLed({
-        {0, true},
-        {100, false}
-      }, 1000);
-    }
-  }
-  // only virtual button ready
-  else if (s3xy_ready() && !s3xy_stalk_ready()) {
-    if (!led.isRunning() || led.isRepeating()) {
-      led.runLed({
-        {0, true},
-        {100, false},
-        {200, true},
-        {300, false}
-      }, 1000);
-    }
-  }
-  // only stalk ready
-  else if (!s3xy_ready() && s3xy_stalk_ready()) {
-    if (!led.isRunning() || led.isRepeating()) {
-      led.runLed({
-        {0, true},
-        {100, false},
-        {200, true},
-        {300, false},
-        {400, true},
-        {500, false}
-      }, 1000);
-    }
-  }
-  // both ready
-  else {
-    if (led.isRepeating() || !led.isRunning()) {
-      led.set(true);
-    }
+  {"ENH_BTN",
+   "00003D46-87D2-479E-7E45-8551415A6DE1",
+   "00003D50-87D2-479E-7E45-8551415A6DE1",
+   "00003D49-87D2-479E-7E45-8551415A6DE1",
+   "button", onButtonNotify},
+};
 
-    if (Serial.available()) {
-      S3XYButtonAction action;
-      if (serialInputToAction(Serial.read(), &action)) {
-        executeButtonAction(action);
+static constexpr size_t PROFILE_COUNT =
+    sizeof(PROFILES) / sizeof(PROFILES[0]);
+
+S3XYDeviceManager manager(PROFILES, PROFILE_COUNT);
+
+// ----- Virtual button callbacks -----
+
+static void onCommanderConnected() {
+  ESP_LOGI(TAG, "Commander connected");
+}
+
+static void onCommanderDisconnected() {
+  ESP_LOGI(TAG, "Commander disconnected");
+}
+
+// ----- LED state machine -----
+
+static void updateLed() {
+  if (manager.isPairing()) {
+    // Fast blink — pairing mode
+    led.runLed({{0, true}, {100, false}}, 200);
+  } else if (manager.deviceCount() == 0) {
+    // Solid OFF — no devices paired
+    led.set(false);
+  } else if (manager.allReady()) {
+    // Solid ON — everything connected
+    led.set(true);
+  } else {
+    // Slow double-blink — not all ready
+    led.runLed({{0, true}, {100, false},
+                {200, true}, {300, false}}, 1000);
+  }
+}
+
+// ----- Main task -----
+
+static void main_task(void* pvParameters) {
+  // Init BLE stack
+  NimBLEDevice::init("ENH_BTN");
+
+  // Virtual button (peripheral)
+  s3xy_on_connect(onCommanderConnected);
+  s3xy_on_disconnect(onCommanderDisconnected);
+  s3xy_begin("ENH_BTN");
+
+  // Device manager (central + pairing button on GPIO 9)
+  manager.begin(GPIO_NUM_9, 5000, 30000, 15000);
+
+  // LED
+  led.begin();
+
+  ESP_LOGI(TAG, "S3XY Bridge started");
+
+  // Main loop
+  while (1) {
+    s3xy_loop();
+    manager.loop();
+    updateLed();
+
+    // Process stalk input actions → forward to virtual button
+    S3XYButtonAction action;
+    while (s3xy_stalk_input_dequeue_action(&action)) {
+      if (s3xy_ready()) {
+        if (action == S3XYButtonAction::Single) {
+          s3xy_send_single();
+          ESP_LOGI(TAG, "Forwarded single press");
+        } else if (action == S3XYButtonAction::Double) {
+          s3xy_send_double();
+          ESP_LOGI(TAG, "Forwarded double press");
+        } else if (action == S3XYButtonAction::Long) {
+          s3xy_send_long();
+          ESP_LOGI(TAG, "Forwarded long press");
+        }
       }
     }
 
-    processQueuedButtonActions();
+    delay_ms(10);  // yield to FreeRTOS
+  }
+}
+
+extern "C" void app_main(void) {
+  // Initialize NVS (required before any nvs_open or NimBLE calls)
+  esp_err_t ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+      ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_LOGW(TAG, "Erasing NVS flash...");
+    nvs_flash_erase();
+    nvs_flash_init();
   }
 
-  s3xy_stalk_loop();
+  xTaskCreate(main_task, "main_task", 8192, nullptr, 5, nullptr);
 }

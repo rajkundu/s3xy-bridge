@@ -1,5 +1,5 @@
 #pragma once
-#include <stdint.h>
+#include <cstdint>
 
 enum class S3XYButtonAction : uint8_t {
   Single,

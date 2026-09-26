@@ -1,26 +1,47 @@
 #include "Led.h"
+#include <esp_log.h>
 
 namespace {
 
 constexpr bool LED_DEBUG = false;
+static const char* TAG = "LED";
 
 }  // namespace
 
-Led::Led(uint8_t pin) : pin_(pin) {}
+Led::Led(gpio_num_t pin) : pin_(pin) {}
 
 void Led::begin() {
-  pinMode(pin_, OUTPUT);
+  gpio_config_t io_conf = {};
+  io_conf.intr_type = GPIO_INTR_DISABLE;
+  io_conf.mode = GPIO_MODE_OUTPUT;
+  io_conf.pin_bit_mask = (1ULL << pin_);
+  io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+  gpio_config(&io_conf);
+
   set(false);
-  ticker_.attach_ms(UPDATE_INTERVAL_MS, [this]() { update(); });
+
+  esp_timer_create_args_t timer_args = {};
+  timer_args.callback = &Led::timer_callback;
+  timer_args.arg = this;
+  timer_args.name = "led_timer";
+  esp_timer_create(&timer_args, &ticker_);
+  esp_timer_start_periodic(ticker_, UPDATE_INTERVAL_MS * 1000);
+
   if (LED_DEBUG) {
-    Serial.printf("[led] started on pin %u\n", pin_);
+    ESP_LOGD(TAG, "started on pin %d", pin_);
   }
+}
+
+void Led::timer_callback(void* arg) {
+  Led* led = static_cast<Led*>(arg);
+  led->update();
 }
 
 void Led::runLed(const LedPattern& pattern, unsigned long cycleDuration) {
   if (pattern.size() == 0) {
     if (LED_DEBUG) {
-      Serial.println("[led] ignored empty pattern");
+      ESP_LOGD(TAG, "ignored empty pattern");
     }
     return;
   }
@@ -50,8 +71,8 @@ void Led::runLed(const LedPattern& pattern, unsigned long cycleDuration) {
   cycleDuration_ = cycleDuration;
   running_ = true;
   if (LED_DEBUG) {
-    Serial.printf("[led] starting pattern (%u states, cycle %lu ms)\n",
-                  static_cast<unsigned>(pattern.size()), cycleDuration);
+    ESP_LOGD(TAG, "starting pattern (%u states, cycle %lu ms)",
+             static_cast<unsigned>(pattern.size()), cycleDuration);
   }
   update();
 }
@@ -59,7 +80,7 @@ void Led::runLed(const LedPattern& pattern, unsigned long cycleDuration) {
 void Led::set(bool on) {
   running_ = false;
   if (LED_DEBUG) {
-    Serial.printf("[led] set %s\n", on ? "on" : "off");
+    ESP_LOGD(TAG, "set %s", on ? "on" : "off");
   }
   write(on);
 }
@@ -83,7 +104,7 @@ void Led::update() {
       currentStep_ = 0;
       patternStartedAt_ = millis();
       if (LED_DEBUG) {
-        Serial.println("[led] repeating pattern");
+        ESP_LOGD(TAG, "repeating pattern");
       }
     }
 
@@ -101,9 +122,9 @@ void Led::update() {
 
     write(states_[currentStep_].on);
     if (LED_DEBUG) {
-      Serial.printf("[led] keyframe %u ms -> %s\n",
-                    states_[currentStep_].timestamp,
-                    states_[currentStep_].on ? "on" : "off");
+      ESP_LOGD(TAG, "keyframe %lu ms -> %s",
+               states_[currentStep_].timestamp,
+               states_[currentStep_].on ? "on" : "off");
     }
     ++currentStep_;
 
@@ -123,10 +144,10 @@ void Led::update() {
 void Led::finishPattern() {
   running_ = false;
   if (LED_DEBUG) {
-    Serial.println("[led] pattern finished");
+    ESP_LOGD(TAG, "pattern finished");
   }
 }
 
 void Led::write(bool on) {
-  digitalWrite(pin_, on ? HIGH : LOW);
+  gpio_set_level(pin_, on ? 1 : 0);
 }

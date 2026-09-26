@@ -1,0 +1,449 @@
+#include "S3XYDeviceManager.h"
+
+#include "compat.h"
+#include "NimBLEDevice.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+
+#include <cstring>
+#include <cstdio>
+
+static const char* TAG = "manager";
+
+// ============================================================
+// Pairing scan callback — discovers any ENH_* device
+// ============================================================
+
+class PairingLocatorCallbacks : public NimBLEScanCallbacks {
+ public:
+  explicit PairingLocatorCallbacks(S3XYDeviceManager* mgr) : mgr_(mgr) {}
+
+  void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+    if (!advertisedDevice->haveName()) return;
+
+    std::string name = advertisedDevice->getName();
+    if (name.rfind("ENH_", 0) != 0) return;  // startsWith("ENH_")
+
+    std::string mac = advertisedDevice->getAddress().toString();
+    if (mgr_->isDeviceKnown(mac)) return;
+
+    size_t profIdx;
+    if (!mgr_->matchProfile(name.c_str(), &profIdx)) return;
+
+    ESP_LOGI(TAG, "*** Pairing scan found: %s (%s) ***", name.c_str(), mac.c_str());
+
+    foundMac_ = mac;
+    foundName_ = name;
+    matchedProfileIndex_ = profIdx;
+    found_ = true;
+    NimBLEDevice::getScan()->stop();
+  }
+
+  bool found() const { return found_; }
+  const std::string& foundMac() const { return foundMac_; }
+  const std::string& foundName() const { return foundName_; }
+  size_t matchedProfileIndex() const { return matchedProfileIndex_; }
+
+ private:
+  S3XYDeviceManager* mgr_;
+  std::string foundMac_;
+  std::string foundName_;
+  size_t matchedProfileIndex_ = 0;
+  bool found_ = false;
+};
+
+// ============================================================
+// Construction / destruction
+// ============================================================
+
+S3XYDeviceManager::S3XYDeviceManager(const S3XYDeviceProfile* profiles,
+                                     size_t profileCount)
+    : profiles_(profiles), profileCount_(profileCount) {}
+
+S3XYDeviceManager::~S3XYDeviceManager() {
+  for (size_t i = 0; i < deviceCount_; ++i) {
+    freeDevice(i);
+  }
+}
+
+// ============================================================
+// Public API
+// ============================================================
+
+void S3XYDeviceManager::begin(gpio_num_t pairPin,
+                               uint32_t pressDurationMs,
+                               uint32_t pairingWindowMs,
+                               uint32_t unpairDurationMs) {
+  pairPin_ = pairPin;
+  pressDurationMs_ = pressDurationMs;
+  pairingWindowMs_ = pairingWindowMs;
+  unpairDurationMs_ = unpairDurationMs;
+
+  // Configure pair button GPIO
+  gpio_config_t io_conf = {};
+  io_conf.intr_type = GPIO_INTR_DISABLE;
+  io_conf.mode = GPIO_MODE_INPUT;
+  io_conf.pin_bit_mask = (1ULL << pairPin_);
+  io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+  io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  gpio_config(&io_conf);
+
+  loadDevices();
+
+  if (deviceCount_ == 0) {
+    ESP_LOGI(TAG, "No saved devices. Hold pair button (%d) for %lu ms to enter pairing mode.",
+             pairPin_, (unsigned long)pressDurationMs_);
+  }
+}
+
+void S3XYDeviceManager::loop() {
+  checkPairButton();
+
+  if (pairingMode_) {
+    if (millis() >= pairingEndTime_) {
+      exitPairingMode();
+    } else {
+      pairingScan();
+    }
+
+    // During pairing: only tick connected devices (health check only,
+    // no reconnect scans to avoid BLE scan singleton conflicts).
+    for (size_t i = 0; i < deviceCount_; ++i) {
+      if (devices_[i] && devices_[i]->connected()) {
+        devices_[i]->loop();
+      }
+    }
+  } else {
+    // Normal mode: let all devices run (scan + reconnect)
+    for (size_t i = 0; i < deviceCount_; ++i) {
+      if (devices_[i]) {
+        devices_[i]->loop();
+      }
+    }
+  }
+}
+
+S3XYDevice* S3XYDeviceManager::device(size_t index) const {
+  if (index >= deviceCount_) return nullptr;
+  return devices_[index];
+}
+
+bool S3XYDeviceManager::anyReady() const {
+  for (size_t i = 0; i < deviceCount_; ++i) {
+    if (devices_[i] && devices_[i]->ready()) return true;
+  }
+  return false;
+}
+
+bool S3XYDeviceManager::allReady() const {
+  if (deviceCount_ == 0) return false;
+  for (size_t i = 0; i < deviceCount_; ++i) {
+    if (!devices_[i] || !devices_[i]->ready()) return false;
+  }
+  return true;
+}
+
+// ============================================================
+// Button handling
+// ============================================================
+
+void S3XYDeviceManager::checkPairButton() {
+  bool pressed = (gpio_get_level(pairPin_) == 0);  // Active LOW
+
+  if (pressed && !buttonWasPressed_) {
+    // Button just pressed — record start time
+    buttonPressedAt_ = millis();
+    pairActionTaken_ = false;
+  }
+
+  if (pressed && !pairActionTaken_) {
+    uint32_t held = millis() - buttonPressedAt_;
+
+    // Check unpair threshold first (longer hold)
+    if (held >= unpairDurationMs_) {
+      ESP_LOGW(TAG, "*** UNPAIR ALL — long press detected ***");
+      unpairAll();
+      pairActionTaken_ = true;
+    }
+    // Then pairing threshold
+    else if (held >= pressDurationMs_ && !pairingMode_) {
+      enterPairingMode();
+      pairActionTaken_ = true;
+    }
+  }
+
+  buttonWasPressed_ = pressed;
+}
+
+// ============================================================
+// Pairing mode
+// ============================================================
+
+void S3XYDeviceManager::enterPairingMode() {
+  pairingMode_ = true;
+  pairingEndTime_ = millis() + pairingWindowMs_;
+  ESP_LOGI(TAG, "Entering pairing mode for %lu ms", (unsigned long)pairingWindowMs_);
+}
+
+void S3XYDeviceManager::exitPairingMode() {
+  pairingMode_ = false;
+  ESP_LOGI(TAG, "Exiting pairing mode");
+}
+
+void S3XYDeviceManager::pairingScan() {
+  if (deviceCount_ >= MAX_DEVICES) {
+    ESP_LOGW(TAG, "Max devices (%u) reached, exiting pairing mode",
+             (unsigned)MAX_DEVICES);
+    exitPairingMode();
+    return;
+  }
+
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  scan->setActiveScan(true);
+  scan->setInterval(100);
+  scan->setWindow(80);
+
+  ESP_LOGD(TAG, "Pairing scan...");
+
+  PairingLocatorCallbacks callbacks(this);
+  scan->setScanCallbacks(&callbacks);
+  scan->start(5000, false);  // 5-second scan window (milliseconds!)
+  scan->setScanCallbacks(nullptr);
+  scan->clearResults();
+
+  if (!callbacks.found()) return;
+
+  // Found a new device — add it
+  addDevice(callbacks.foundMac().c_str(),
+            callbacks.foundName().c_str(),
+            callbacks.matchedProfileIndex());
+}
+
+// ============================================================
+// Profile matching
+// ============================================================
+
+const S3XYDeviceProfile* S3XYDeviceManager::matchProfile(
+    const char* bleName, size_t* outIndex) const {
+  for (size_t i = 0; i < profileCount_; ++i) {
+    // Check if bleName starts with the profile's namePrefix
+    size_t prefixLen = strlen(profiles_[i].namePrefix);
+    if (strncmp(bleName, profiles_[i].namePrefix, prefixLen) == 0) {
+      if (outIndex) *outIndex = i;
+      return &profiles_[i];
+    }
+  }
+  return nullptr;
+}
+
+bool S3XYDeviceManager::isDeviceKnown(const std::string& mac) const {
+  for (size_t i = 0; i < deviceCount_; ++i) {
+    if (devices_[i] && devices_[i]->mac() == mac) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ============================================================
+// Device management
+// ============================================================
+
+S3XYDevice* S3XYDeviceManager::addDevice(const char* mac,
+                                          const char* bleName,
+                                          size_t profileIndex) {
+  if (deviceCount_ >= MAX_DEVICES) return nullptr;
+
+  size_t idx = deviceCount_;
+  const auto& prof = profiles_[profileIndex];
+
+  // Generate tag: "dev_0", "dev_1", etc.
+  char tagBuf[8];
+  snprintf(tagBuf, sizeof(tagBuf), "dev_%u", (unsigned)idx);
+  tags_[idx] = strdup(tagBuf);
+  names_[idx] = strdup(bleName);
+
+  // Pre-write MAC to NVS using S3XYDevice's key format ("mac_<tag>")
+  // so that begin() -> loadSavedMac() finds it immediately.
+  {
+    nvs_handle_t handle;
+    if (nvs_open("s3xy", NVS_READWRITE, &handle) == ESP_OK) {
+      char key[16];
+      snprintf(key, sizeof(key), "mac_%s", tags_[idx]);
+      nvs_set_str(handle, key, mac);
+      nvs_commit(handle);
+      nvs_close(handle);
+    }
+  }
+
+  // Create device with profile UUIDs
+  auto* dev = new S3XYDevice(
+      tags_[idx],
+      names_[idx],
+      prof.serviceUUID,
+      prof.notifyUUID,
+      prof.idUUID);
+
+  dev->onNotify(prof.notifyCallback);
+  dev->begin();  // loads the pre-written MAC
+
+  devices_[idx] = dev;
+  profileIndices_[idx] = profileIndex;
+  deviceCount_++;
+
+  saveDevices();
+
+  ESP_LOGI(TAG, "Added device [%s] %s (%s) as %s",
+           tags_[idx], bleName, mac, prof.typeName);
+  return dev;
+}
+
+void S3XYDeviceManager::freeDevice(size_t index) {
+  if (index >= deviceCount_) return;
+
+  delete devices_[index];
+  devices_[index] = nullptr;
+
+  free(tags_[index]);
+  tags_[index] = nullptr;
+
+  free(names_[index]);
+  names_[index] = nullptr;
+}
+
+void S3XYDeviceManager::unpairAll() {
+  ESP_LOGW(TAG, "Unpairing all %u device(s)", (unsigned)deviceCount_);
+
+  for (size_t i = 0; i < deviceCount_; ++i) {
+    // Clear the device's own NVS MAC
+    if (devices_[i]) {
+      devices_[i]->clearSavedMac();
+    }
+    freeDevice(i);
+  }
+  deviceCount_ = 0;
+
+  // Clear manager's NVS
+  nvs_handle_t handle;
+  if (nvs_open("s3xy_mgr", NVS_READWRITE, &handle) == ESP_OK) {
+    nvs_erase_all(handle);
+    nvs_commit(handle);
+    nvs_close(handle);
+  }
+
+  ESP_LOGI(TAG, "All devices unpaired");
+}
+
+void S3XYDeviceManager::unpair(size_t index) {
+  if (index >= deviceCount_) return;
+
+  ESP_LOGI(TAG, "Unpairing device %u [%s]", (unsigned)index,
+           tags_[index] ? tags_[index] : "?");
+
+  if (devices_[index]) {
+    devices_[index]->clearSavedMac();
+  }
+  freeDevice(index);
+
+  // Compact arrays: shift everything after `index` down by one
+  for (size_t i = index; i + 1 < deviceCount_; ++i) {
+    devices_[i] = devices_[i + 1];
+    profileIndices_[i] = profileIndices_[i + 1];
+    tags_[i] = tags_[i + 1];
+    names_[i] = names_[i + 1];
+  }
+  deviceCount_--;
+  devices_[deviceCount_] = nullptr;
+  tags_[deviceCount_] = nullptr;
+  names_[deviceCount_] = nullptr;
+
+  saveDevices();
+}
+
+// ============================================================
+// NVS persistence
+// ============================================================
+
+void S3XYDeviceManager::saveDevices() {
+  nvs_handle_t handle;
+  if (nvs_open("s3xy_mgr", NVS_READWRITE, &handle) != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to open NVS for save");
+    return;
+  }
+
+  nvs_set_u8(handle, "dev_cnt", (uint8_t)deviceCount_);
+
+  for (size_t i = 0; i < deviceCount_; ++i) {
+    char profKey[12], nameKey[12];
+    snprintf(profKey, sizeof(profKey), "d%u_prof", (unsigned)i);
+    snprintf(nameKey, sizeof(nameKey), "d%u_name", (unsigned)i);
+
+    nvs_set_u8(handle, profKey, profileIndices_[i]);
+    nvs_set_str(handle, nameKey, names_[i] ? names_[i] : "");
+  }
+
+  nvs_commit(handle);
+  nvs_close(handle);
+
+  ESP_LOGD(TAG, "Saved %u device(s) to NVS", (unsigned)deviceCount_);
+}
+
+void S3XYDeviceManager::loadDevices() {
+  nvs_handle_t handle;
+  if (nvs_open("s3xy_mgr", NVS_READONLY, &handle) != ESP_OK) {
+    ESP_LOGI(TAG, "No saved device data in NVS");
+    return;
+  }
+
+  uint8_t count = 0;
+  nvs_get_u8(handle, "dev_cnt", &count);
+
+  for (size_t i = 0; i < count && i < MAX_DEVICES; ++i) {
+    char profKey[12], nameKey[12];
+    snprintf(profKey, sizeof(profKey), "d%u_prof", (unsigned)i);
+    snprintf(nameKey, sizeof(nameKey), "d%u_name", (unsigned)i);
+
+    uint8_t profIdx = 0xFF;
+    nvs_get_u8(handle, profKey, &profIdx);
+
+    size_t nameLen = 0;
+    char* nameBuf = nullptr;
+    if (nvs_get_str(handle, nameKey, nullptr, &nameLen) == ESP_OK && nameLen > 0) {
+      nameBuf = new char[nameLen];
+      nvs_get_str(handle, nameKey, nameBuf, &nameLen);
+    }
+
+    if (profIdx >= profileCount_ || !nameBuf || nameLen == 0) {
+      delete[] nameBuf;
+      continue;
+    }
+
+    const auto& prof = profiles_[profIdx];
+
+    // Generate tag
+    char tagBuf[8];
+    snprintf(tagBuf, sizeof(tagBuf), "dev_%u", (unsigned)i);
+    tags_[i] = strdup(tagBuf);
+    names_[i] = nameBuf;  // take ownership
+
+    auto* dev = new S3XYDevice(
+        tags_[i],
+        names_[i],
+        prof.serviceUUID,
+        prof.notifyUUID,
+        prof.idUUID);
+
+    dev->onNotify(prof.notifyCallback);
+    dev->begin();  // loads MAC from "mac_dev_N"
+
+    devices_[i] = dev;
+    profileIndices_[i] = profIdx;
+    deviceCount_++;
+
+    ESP_LOGI(TAG, "Restored device [%s] %s as %s",
+             tags_[i], names_[i], prof.typeName);
+  }
+
+  nvs_close(handle);
+}

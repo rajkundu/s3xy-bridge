@@ -1,6 +1,11 @@
 #include "S3XYStalkInput.h"
+#include <esp_log.h>
+#include "compat.h"
+#include <cstdio>
 
 namespace {
+
+static const char* TAG = "stalk_input";
 
 const size_t ACTION_QUEUE_SIZE = 8;
 const unsigned long LONG_PRESS_MS = 750;
@@ -44,7 +49,7 @@ void handleTrigger(const StalkTrigger& trigger, uint32_t code) {
   if (code == trigger.pressCode) {
     *trigger.pressTime = millis();
     s3xy_stalk_input_queue_action(trigger.pressAction);
-    Serial.printf("[stalk-input] %s pressed\n", trigger.label);
+    ESP_LOGD(TAG, "%s pressed", trigger.label);
     return;
   }
 
@@ -53,28 +58,16 @@ void handleTrigger(const StalkTrigger& trigger, uint32_t code) {
   }
 
   if (*trigger.pressTime == 0) {
-    Serial.printf(
-        "[stalk-input] %s release before press -> ignored\n",
-        trigger.label
-    );
+    ESP_LOGD(TAG, "%s release before press -> ignored", trigger.label);
     return;
   }
 
   unsigned long elapsed = millis() - *trigger.pressTime;
   if (elapsed >= LONG_PRESS_MS) {
     s3xy_stalk_input_queue_action(trigger.longReleaseAction);
-
-    Serial.printf(
-        "[stalk-input] %s long release (elapsed=%lu ms)\n",
-        trigger.label,
-        elapsed
-    );
+    ESP_LOGD(TAG, "%s long release (elapsed=%lu ms)", trigger.label, elapsed);
   } else {
-    Serial.printf(
-        "[stalk-input] %s short release -> ignored (elapsed=%lu ms)\n",
-        trigger.label,
-        elapsed
-    );
+    ESP_LOGD(TAG, "%s short release -> ignored (elapsed=%lu ms)", trigger.label, elapsed);
   }
 
   *trigger.pressTime = 0;
@@ -85,7 +78,7 @@ void handleTrigger(const StalkTrigger& trigger, uint32_t code) {
 void s3xy_stalk_input_queue_action(S3XYButtonAction action) {
   size_t nextTail = (actionQueueTail + 1) % ACTION_QUEUE_SIZE;
   if (nextTail == actionQueueHead) {
-    Serial.println("[stalk-input] action queue full -> dropping oldest event");
+    ESP_LOGI(TAG, "action queue full -> dropping oldest event");
     actionQueueHead = (actionQueueHead + 1) % ACTION_QUEUE_SIZE;
   }
 
@@ -104,14 +97,12 @@ bool s3xy_stalk_input_dequeue_action(S3XYButtonAction* action) {
 }
 
 void s3xy_stalk_input_handle_notify(const uint8_t* data, size_t len) {
-  Serial.print("[stalk-input] packet: ");
-  for (size_t i = 0; i < len; ++i) {
-    Serial.printf("%02X", data[i]);
-    if (i + 1 < len) {
-      Serial.print(" ");
-    }
+  char hex_buf[128] = {0};
+  size_t offset = 0;
+  for (size_t i = 0; i < len && offset < sizeof(hex_buf) - 4; ++i) {
+    offset += snprintf(hex_buf + offset, sizeof(hex_buf) - offset, "%02X ", data[i]);
   }
-  Serial.println();
+  ESP_LOGI(TAG, "packet: %s", hex_buf);
 
   uint32_t code = parseStalkCode(data, len);
   static const StalkTrigger triggers[] = {

@@ -1,2 +1,8 @@
 .pio
 .vscode
+.cache
+build/
+managed_components/
+sdkconfig.esp32-c6
+sdkconfig.esp32-c6.old
+dependencies.lock
