@@ -12,6 +12,44 @@
 static const char* TAG = "manager";
 
 // ============================================================
+// Shared Non-Blocking Reconnect Scan Callback
+// ============================================================
+// Listens for ALL disconnected devices in a single scan pass.
+
+class ReconnectScanCallbacks : public NimBLEScanCallbacks {
+ public:
+  explicit ReconnectScanCallbacks(S3XYDeviceManager* mgr) : mgr_(mgr) {}
+
+  void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+    std::string mac = advertisedDevice->getAddress().toString();
+
+    for (size_t i = 0; i < mgr_->deviceCount(); ++i) {
+      S3XYDevice* dev = mgr_->device(i);
+      if (!dev || dev->connected() || dev->connecting()) {
+        continue;
+      }
+
+      if (dev->mac() == mac) {
+        if (!dev->hasTargetDevice()) {
+          ESP_LOGI(TAG, "Scan matched saved device [%u] (%s)",
+                   (unsigned)i, mac.c_str());
+          dev->setTargetDevice(*advertisedDevice);
+        }
+        // Stop scan immediately so main loop can initiate connection right away
+        NimBLEDevice::getScan()->stop();
+        return;
+      }
+    }
+  }
+
+ private:
+  S3XYDeviceManager* mgr_;
+};
+
+// Static instance so its lifetime persists across non-blocking scans
+static ReconnectScanCallbacks* s_reconnectCallbacks = nullptr;
+
+// ============================================================
 // Pairing scan callback — discovers any ENH_* device
 // ============================================================
 
@@ -59,6 +97,7 @@ class PairingLocatorCallbacks : public NimBLEScanCallbacks {
     ESP_LOGI(TAG, "*** Pairing candidate: %s (%s), profile=%s ***",
              name.c_str(), mac.c_str(), profile->typeName);
 
+    foundDevice_ = new NimBLEAdvertisedDevice(*advertisedDevice);
     foundMac_ = mac;
     foundName_ = name;
     matchedProfileIndex_ = profIdx;
@@ -66,13 +105,19 @@ class PairingLocatorCallbacks : public NimBLEScanCallbacks {
     NimBLEDevice::getScan()->stop();
   }
 
+  ~PairingLocatorCallbacks() override {
+    delete foundDevice_;
+  }
+
   bool found() const { return found_; }
+  const NimBLEAdvertisedDevice* foundDevice() const { return foundDevice_; }
   const std::string& foundMac() const { return foundMac_; }
   const std::string& foundName() const { return foundName_; }
   size_t matchedProfileIndex() const { return matchedProfileIndex_; }
 
  private:
   S3XYDeviceManager* mgr_;
+  NimBLEAdvertisedDevice* foundDevice_ = nullptr;
   std::string foundMac_;
   std::string foundName_;
   size_t matchedProfileIndex_ = 0;
@@ -83,11 +128,23 @@ class PairingLocatorCallbacks : public NimBLEScanCallbacks {
 // Construction / destruction
 // ============================================================
 
+static S3XYDeviceManager* s_instance = nullptr;
+
+S3XYDeviceManager* S3XYDeviceManager::instance() {
+  return s_instance;
+}
+
 S3XYDeviceManager::S3XYDeviceManager(const S3XYDeviceProfile* profiles,
                                      size_t profileCount)
-    : profiles_(profiles), profileCount_(profileCount) {}
+    : profiles_(profiles), profileCount_(profileCount) {
+  s_instance = this;
+  if (!s_reconnectCallbacks) {
+    s_reconnectCallbacks = new ReconnectScanCallbacks(this);
+  }
+}
 
 S3XYDeviceManager::~S3XYDeviceManager() {
+  if (s_instance == this) s_instance = nullptr;
   for (size_t i = 0; i < deviceCount_; ++i) {
     freeDevice(i);
   }
@@ -123,6 +180,58 @@ void S3XYDeviceManager::begin(gpio_num_t pairPin,
   }
 }
 
+void S3XYDeviceManager::updateBackgroundScan() {
+  NimBLEScan* scan = NimBLEDevice::getScan();
+
+  bool anyInitiating = false;
+  bool anyTargetReady = false;
+  bool anyDisconnected = false;
+  bool anyConnected = false;
+
+  for (size_t i = 0; i < deviceCount_; ++i) {
+    S3XYDevice* dev = devices_[i];
+    if (!dev) continue;
+
+    if (dev->connected()) {
+      anyConnected = true;
+    } else {
+      anyDisconnected = true;
+      if (dev->connecting()) {
+        anyInitiating = true;
+      }
+      if (dev->hasTargetDevice()) {
+        anyTargetReady = true;
+      }
+    }
+  }
+
+  if (!anyDisconnected || anyInitiating || anyTargetReady) {
+    if (scan->isScanning()) {
+      scan->stop();
+    }
+    return;
+  }
+
+  if (!scan->isScanning() && millis() >= nextReconnectScanTime_) {
+    scan->clearResults();
+    scan->setScanCallbacks(s_reconnectCallbacks, false);
+    scan->setActiveScan(false);
+
+    // Use aggressive 80% duty cycle when no devices are connected OR during
+    // the first 30 seconds after boot until all devices have connected.
+    if (!anyConnected || millis() < 30000) {
+      scan->setInterval(100);
+      scan->setWindow(80);
+    } else {
+      scan->setInterval(160);
+      scan->setWindow(40);
+    }
+
+    scan->start(4000, false, false);
+    nextReconnectScanTime_ = millis() + 4100;
+  }
+}
+
 void S3XYDeviceManager::loop() {
   checkPairButton();
 
@@ -146,10 +255,9 @@ void S3XYDeviceManager::loop() {
       pairingScan();
     }
 
-    // During pairing: only tick connected devices (health check only,
-    // no reconnect scans to avoid BLE scan singleton conflicts).
     for (size_t i = 0; i < deviceCount_; ++i) {
-      if (devices_[i] && (devices_[i]->connected() || devices_[i]->connecting())) {
+      if (devices_[i] && (devices_[i]->connected() || devices_[i]->connecting() ||
+                          devices_[i]->hasTargetDevice())) {
         devices_[i]->loop();
       }
     }
@@ -162,12 +270,46 @@ void S3XYDeviceManager::loop() {
       pairingCandidateIndex_ = MAX_DEVICES;
       exitPairingMode();
     }
-  } else {
-    // Normal mode: let all devices run (scan + reconnect)
+    return;
+  }
+
+  // Normal mode:
+  // 1. Manage the single shared non-blocking scanner
+  updateBackgroundScan();
+
+  // 2. Check if any device is currently in the GAP connection-initiation phase.
+  //    Once `onConnect` fires (`linkEstablished_`), the GAP initiator is free,
+  //    so the next device can start its 2 ms async connect() in parallel with
+  //    the current device's GATT discovery.
+  bool initiatorBusy = false;
+  for (size_t i = 0; i < deviceCount_; ++i) {
+    if (devices_[i] && devices_[i]->initiating()) {
+      initiatorBusy = true;
+      break;
+    }
+  }
+
+  // 3. First pass: if the GAP initiator is free, kick off the next queued
+  //    device's async connect() BEFORE any blocking GATT discovery runs.
+  if (!initiatorBusy) {
     for (size_t i = 0; i < deviceCount_; ++i) {
-      if (devices_[i]) {
-        devices_[i]->loop();
+      S3XYDevice* dev = devices_[i];
+      if (dev && !dev->connected() && !dev->connecting() && dev->hasTargetDevice()) {
+        dev->loop();
+        if (dev->connecting()) {
+          initiatorBusy = true;
+          break;
+        }
       }
+    }
+  }
+
+  // 4. Second pass: tick already-connected devices and any device whose
+  //    link is established and needs to finish GATT service discovery.
+  for (size_t i = 0; i < deviceCount_; ++i) {
+    S3XYDevice* dev = devices_[i];
+    if (dev && (dev->connected() || dev->connecting())) {
+      dev->loop();
     }
   }
 }
@@ -175,6 +317,15 @@ void S3XYDeviceManager::loop() {
 S3XYDevice* S3XYDeviceManager::device(size_t index) const {
   if (index >= deviceCount_) return nullptr;
   return devices_[index];
+}
+
+S3XYDevice* S3XYDeviceManager::findDeviceByMac(const std::string& mac) const {
+  for (size_t i = 0; i < deviceCount_; ++i) {
+    if (devices_[i] && devices_[i]->mac() == mac) {
+      return devices_[i];
+    }
+  }
+  return nullptr;
 }
 
 bool S3XYDeviceManager::anyReady() const {
@@ -197,10 +348,9 @@ bool S3XYDeviceManager::allReady() const {
 // ============================================================
 
 void S3XYDeviceManager::checkPairButton() {
-  bool pressed = (gpio_get_level(pairPin_) == 0);  // Active LOW
+  bool pressed = (gpio_get_level(pairPin_) == 0);
 
   if (pressed && !buttonWasPressed_) {
-    // Button just pressed — record start time
     buttonPressedAt_ = millis();
     pairActionTaken_ = false;
   }
@@ -208,14 +358,11 @@ void S3XYDeviceManager::checkPairButton() {
   if (pressed && !pairActionTaken_) {
     uint32_t held = millis() - buttonPressedAt_;
 
-    // Check unpair threshold first (longer hold)
     if (held >= unpairDurationMs_) {
       ESP_LOGW(TAG, "*** UNPAIR ALL — long press detected ***");
       unpairAll();
       pairActionTaken_ = true;
-    }
-    // Then pairing threshold
-    else if (held >= pressDurationMs_ && !pairingMode_) {
+    } else if (held >= pressDurationMs_ && !pairingMode_) {
       enterPairingMode();
       pairActionTaken_ = true;
     }
@@ -229,6 +376,9 @@ void S3XYDeviceManager::checkPairButton() {
 // ============================================================
 
 void S3XYDeviceManager::enterPairingMode() {
+  if (NimBLEDevice::getScan()->isScanning()) {
+    NimBLEDevice::getScan()->stop();
+  }
   pairingMode_ = true;
   pairingCandidateIndex_ = MAX_DEVICES;
   pairingJustEntered_ = true;
@@ -239,6 +389,7 @@ void S3XYDeviceManager::enterPairingMode() {
 
 void S3XYDeviceManager::exitPairingMode() {
   pairingMode_ = false;
+  nextReconnectScanTime_ = 0;
   ESP_LOGI(TAG, "Exiting pairing mode");
 }
 
@@ -251,6 +402,10 @@ void S3XYDeviceManager::pairingScan() {
   }
 
   NimBLEScan* scan = NimBLEDevice::getScan();
+  if (scan->isScanning()) {
+    scan->stop();
+  }
+
   scan->setActiveScan(true);
   scan->setInterval(100);
   scan->setWindow(80);
@@ -259,9 +414,7 @@ void S3XYDeviceManager::pairingScan() {
 
   PairingLocatorCallbacks callbacks(this);
   scan->setScanCallbacks(&callbacks);
-  // NimBLE::start() is asynchronous. getResults() blocks this task until the
-  // scan duration expires or the callback stops the scan after a match.
-  scan->getResults(5000, false);
+  scan->getResults(500, false);
   scan->setScanCallbacks(nullptr);
   scan->clearResults();
 
@@ -270,7 +423,6 @@ void S3XYDeviceManager::pairingScan() {
     return;
   }
 
-  // Found a new device — add it
   ESP_LOGI(TAG, "Pairing selected %s (%s), creating central client",
            callbacks.foundName().c_str(), callbacks.foundMac().c_str());
   S3XYDevice* device = addDevice(callbacks.foundMac().c_str(),
@@ -281,10 +433,10 @@ void S3XYDeviceManager::pairingScan() {
   } else {
     ESP_LOGI(TAG, "Pairing candidate stored; attempting connection now");
     pairingCandidateIndex_ = deviceCount_ - 1;
-    device->loop();
-    if (!device->ready()) {
-      ESP_LOGW(TAG, "Pairing connection did not complete; continuing pairing window");
+    if (callbacks.foundDevice()) {
+      device->setTargetDevice(*callbacks.foundDevice());
     }
+    device->loop();
   }
 }
 

@@ -43,6 +43,10 @@ class S3XYDeviceManager {
   bool anyReady() const;
   bool allReady() const;
 
+  // ----- Singleton Accessor & Lookup -----
+  static S3XYDeviceManager* instance();
+  S3XYDevice* findDeviceByMac(const std::string& mac) const;
+
   // ----- Unpairing -----
   void unpairAll();
   void unpair(size_t index);
@@ -75,6 +79,8 @@ class S3XYDeviceManager {
   bool pairingJustEntered_ = false;
   size_t pairingCandidateIndex_ = MAX_DEVICES;
   std::set<std::string> pairingLoggedAddresses_;
+  void updateBackgroundScan();
+  uint32_t nextReconnectScanTime_ = 0;
 
   // Button input
   void checkPairButton();
