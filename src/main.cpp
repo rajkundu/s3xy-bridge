@@ -13,10 +13,10 @@
 
 static const char* TAG = "main";
 
-// On ESP32-C6-SuperMini, the onboard LED is GPIO 8
+// Waveshare ESP32-C6-Zero Mini: onboard WS2812 RGB LED data is GPIO 8.
 static constexpr gpio_num_t LED_PIN = GPIO_NUM_8;
 
-Led led(LED_PIN);
+Led led(LED_PIN, false, true);
 
 // ----- Notification callbacks -----
 
@@ -65,7 +65,7 @@ static void onCommanderDisconnected() {
 static void updateLed() {
   if (manager.isPairing()) {
     // Fast blink — pairing mode
-    led.runLed({{0, true}, {100, false}}, 200);
+    led.runLed({{0, true}, {100, false}}, 1000);
   } else if (manager.deviceCount() == 0) {
     // Solid OFF — no devices paired
     led.set(false);

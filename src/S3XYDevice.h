@@ -48,6 +48,7 @@ class S3XYDevice {
   /// True when connected AND notifications are subscribed.
   /// Currently equivalent to connected(), kept separate for future use.
   bool ready() const;
+    bool connecting() const { return connectionPending_; }
 
   // ----- Callbacks -----
   void onNotify(NotifyCallback cb);
@@ -79,6 +80,8 @@ class S3XYDevice {
 
   bool connected_ = false;
   bool notificationsSubscribed_ = false;
+    bool connectionPending_ = false;
+    bool linkEstablished_ = false;
   uint32_t nextScanTime_ = 0;
 
   NotifyCallback notifyCallback_ = nullptr;

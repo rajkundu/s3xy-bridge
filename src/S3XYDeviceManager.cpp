@@ -22,16 +22,42 @@ class PairingLocatorCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
     if (!advertisedDevice->haveName()) return;
 
-    std::string name = advertisedDevice->getName();
-    if (name.rfind("ENH_", 0) != 0) return;  // startsWith("ENH_")
-
     std::string mac = advertisedDevice->getAddress().toString();
-    if (mgr_->isDeviceKnown(mac)) return;
+    std::string name = advertisedDevice->getName();
+    if (name.rfind("ENH_", 0) != 0) return;
+
+    if (!mgr_->pairingLoggedAddresses_.insert(mac).second) return;
+
+    std::string services;
+    for (uint8_t i = 0; i < advertisedDevice->getServiceUUIDCount(); ++i) {
+      if (!services.empty()) services += ",";
+      services += advertisedDevice->getServiceUUID(i).toString();
+    }
+    if (services.empty()) services = "<none>";
+
+    ESP_LOGI(TAG,
+             "Pairing advertisement: name=%s address=%s rssi=%d services=%s "
+             "connectable=%d scannable=%d",
+             name.c_str(), mac.c_str(), advertisedDevice->getRSSI(),
+             services.c_str(), advertisedDevice->isConnectable(),
+             advertisedDevice->isScannable());
+
+    if (mgr_->isDeviceKnown(mac)) {
+      ESP_LOGI(TAG, "Rejected advertisement %s: device already paired", mac.c_str());
+      return;
+    }
 
     size_t profIdx;
-    if (!mgr_->matchProfile(name.c_str(), &profIdx)) return;
+    const S3XYDeviceProfile* profile =
+        mgr_->matchProfile(advertisedDevice, &profIdx);
+    if (!profile) {
+      ESP_LOGW(TAG, "Rejected ENH_* device %s: no name/service profile matched",
+               mac.c_str());
+      return;
+    }
 
-    ESP_LOGI(TAG, "*** Pairing scan found: %s (%s) ***", name.c_str(), mac.c_str());
+    ESP_LOGI(TAG, "*** Pairing candidate: %s (%s), profile=%s ***",
+             name.c_str(), mac.c_str(), profile->typeName);
 
     foundMac_ = mac;
     foundName_ = name;
@@ -101,18 +127,40 @@ void S3XYDeviceManager::loop() {
   checkPairButton();
 
   if (pairingMode_) {
+    if (pairingJustEntered_) {
+      pairingJustEntered_ = false;
+      return;
+    }
+
+    bool deviceBusy = false;
+    for (size_t i = 0; i < deviceCount_; ++i) {
+      if (devices_[i] && devices_[i]->connecting()) {
+        deviceBusy = true;
+        break;
+      }
+    }
+
     if (millis() >= pairingEndTime_) {
       exitPairingMode();
-    } else {
+    } else if (!deviceBusy) {
       pairingScan();
     }
 
     // During pairing: only tick connected devices (health check only,
     // no reconnect scans to avoid BLE scan singleton conflicts).
     for (size_t i = 0; i < deviceCount_; ++i) {
-      if (devices_[i] && devices_[i]->connected()) {
+      if (devices_[i] && (devices_[i]->connected() || devices_[i]->connecting())) {
         devices_[i]->loop();
       }
+    }
+
+    if (pairingCandidateIndex_ < deviceCount_ &&
+        devices_[pairingCandidateIndex_] &&
+        devices_[pairingCandidateIndex_]->ready()) {
+      ESP_LOGI(TAG, "Pairing successful: %s is connected and subscribed",
+               names_[pairingCandidateIndex_]);
+      pairingCandidateIndex_ = MAX_DEVICES;
+      exitPairingMode();
     }
   } else {
     // Normal mode: let all devices run (scan + reconnect)
@@ -182,6 +230,9 @@ void S3XYDeviceManager::checkPairButton() {
 
 void S3XYDeviceManager::enterPairingMode() {
   pairingMode_ = true;
+  pairingCandidateIndex_ = MAX_DEVICES;
+  pairingJustEntered_ = true;
+  pairingLoggedAddresses_.clear();
   pairingEndTime_ = millis() + pairingWindowMs_;
   ESP_LOGI(TAG, "Entering pairing mode for %lu ms", (unsigned long)pairingWindowMs_);
 }
@@ -204,20 +255,37 @@ void S3XYDeviceManager::pairingScan() {
   scan->setInterval(100);
   scan->setWindow(80);
 
-  ESP_LOGD(TAG, "Pairing scan...");
+  ESP_LOGI(TAG, "Pairing scan started (active, 5 seconds)");
 
   PairingLocatorCallbacks callbacks(this);
   scan->setScanCallbacks(&callbacks);
-  scan->start(5000, false);  // 5-second scan window (milliseconds!)
+  // NimBLE::start() is asynchronous. getResults() blocks this task until the
+  // scan duration expires or the callback stops the scan after a match.
+  scan->getResults(5000, false);
   scan->setScanCallbacks(nullptr);
   scan->clearResults();
 
-  if (!callbacks.found()) return;
+  if (!callbacks.found()) {
+    ESP_LOGI(TAG, "Pairing scan finished: no new matching ENH_* device found");
+    return;
+  }
 
   // Found a new device — add it
-  addDevice(callbacks.foundMac().c_str(),
-            callbacks.foundName().c_str(),
-            callbacks.matchedProfileIndex());
+  ESP_LOGI(TAG, "Pairing selected %s (%s), creating central client",
+           callbacks.foundName().c_str(), callbacks.foundMac().c_str());
+  S3XYDevice* device = addDevice(callbacks.foundMac().c_str(),
+                                 callbacks.foundName().c_str(),
+                                 callbacks.matchedProfileIndex());
+  if (!device) {
+    ESP_LOGE(TAG, "Pairing failed: could not add %s", callbacks.foundName().c_str());
+  } else {
+    ESP_LOGI(TAG, "Pairing candidate stored; attempting connection now");
+    pairingCandidateIndex_ = deviceCount_ - 1;
+    device->loop();
+    if (!device->ready()) {
+      ESP_LOGW(TAG, "Pairing connection did not complete; continuing pairing window");
+    }
+  }
 }
 
 // ============================================================
@@ -225,14 +293,22 @@ void S3XYDeviceManager::pairingScan() {
 // ============================================================
 
 const S3XYDeviceProfile* S3XYDeviceManager::matchProfile(
-    const char* bleName, size_t* outIndex) const {
+    const NimBLEAdvertisedDevice* advertisedDevice, size_t* outIndex) const {
+  const std::string bleName = advertisedDevice->getName();
   for (size_t i = 0; i < profileCount_; ++i) {
-    // Check if bleName starts with the profile's namePrefix
     size_t prefixLen = strlen(profiles_[i].namePrefix);
-    if (strncmp(bleName, profiles_[i].namePrefix, prefixLen) == 0) {
-      if (outIndex) *outIndex = i;
-      return &profiles_[i];
-    }
+    if (bleName.compare(0, prefixLen, profiles_[i].namePrefix) != 0) continue;
+
+    bool serviceMatches = advertisedDevice->haveServiceUUID() &&
+        advertisedDevice->isAdvertisingService(
+            NimBLEUUID(profiles_[i].serviceUUID));
+    ESP_LOGI(TAG, "Profile check: name=%s profile=%s service=%s",
+             bleName.c_str(), profiles_[i].typeName,
+             serviceMatches ? "MATCH" : "MISMATCH");
+    if (!serviceMatches) continue;
+
+    if (outIndex) *outIndex = i;
+    return &profiles_[i];
   }
   return nullptr;
 }

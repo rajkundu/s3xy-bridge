@@ -4,6 +4,7 @@
 #include "S3XYDeviceProfile.h"
 #include "driver/gpio.h"
 #include <cstdint>
+#include <set>
 
 /// Manages dynamic discovery, pairing, and lifecycle of S3XY BLE devices.
 ///
@@ -71,6 +72,9 @@ class S3XYDeviceManager {
   bool pairingMode_ = false;
   uint32_t pairingWindowMs_ = 30000;
   uint32_t pairingEndTime_ = 0;
+  bool pairingJustEntered_ = false;
+  size_t pairingCandidateIndex_ = MAX_DEVICES;
+  std::set<std::string> pairingLoggedAddresses_;
 
   // Button input
   void checkPairButton();
@@ -81,8 +85,9 @@ class S3XYDeviceManager {
   void pairingScan();
 
   // Matching
-  const S3XYDeviceProfile* matchProfile(const char* bleName,
-                                         size_t* outIndex) const;
+  const S3XYDeviceProfile* matchProfile(
+      const NimBLEAdvertisedDevice* advertisedDevice,
+      size_t* outIndex) const;
   bool isDeviceKnown(const std::string& mac) const;
 
   // Device management

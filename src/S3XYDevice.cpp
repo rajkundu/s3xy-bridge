@@ -62,13 +62,63 @@ class DeviceClientCallbacks : public NimBLEClientCallbacks {
   explicit DeviceClientCallbacks(S3XYDevice* owner) : owner_(owner) {}
 
   void onConnect(NimBLEClient*) override {
-    ESP_LOGI(owner_->tag_, "Connected");
+    owner_->linkEstablished_ = true;
+    NimBLEConnInfo info = owner_->client_->getConnInfo();
+    ESP_LOGI(owner_->tag_,
+             "Connection established: interval=%.2f ms latency=%u timeout=%u ms; "
+             "waiting for security/authentication",
+             info.getConnInterval() * 1.25f, info.getConnLatency(),
+             info.getConnTimeout() * 10);
+  }
+
+  bool onConnParamsUpdateRequest(
+      NimBLEClient*, const ble_gap_upd_params* params) override {
+    ESP_LOGI(owner_->tag_,
+             "Connection parameter update requested: interval=%u-%u ms "
+             "latency=%u timeout=%u ms",
+             static_cast<unsigned>(params->itvl_min * 1.25f),
+             static_cast<unsigned>(params->itvl_max * 1.25f),
+             params->latency, params->supervision_timeout * 10);
+    return true;
+  }
+
+  void onConnectFail(NimBLEClient*, int reason) override {
+    owner_->connectionPending_ = false;
+    owner_->linkEstablished_ = false;
+    owner_->nextScanTime_ = millis() + 1000;
+    ESP_LOGW(owner_->tag_, "Connection attempt failed, reason: %d", reason);
+  }
+
+  void onPassKeyEntry(NimBLEConnInfo& connInfo) override {
+    ESP_LOGI(owner_->tag_, "Authorization requested: passkey entry for %s",
+             connInfo.getAddress().toString().c_str());
+  }
+
+  uint32_t onPassKeyDisplay(NimBLEConnInfo& connInfo) override {
+    ESP_LOGI(owner_->tag_, "Authorization requested: passkey display for %s",
+             connInfo.getAddress().toString().c_str());
+    return 0;
+  }
+
+  void onConfirmPasskey(NimBLEConnInfo& connInfo, uint32_t pin) override {
+    ESP_LOGI(owner_->tag_, "Authorization requested: confirm passkey %06lu for %s",
+             static_cast<unsigned long>(pin),
+             connInfo.getAddress().toString().c_str());
+  }
+
+  void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
+    ESP_LOGI(owner_->tag_,
+             "Authentication complete: bonded=%d encrypted=%d authenticated=%d keySize=%u",
+             connInfo.isBonded(), connInfo.isEncrypted(),
+             connInfo.isAuthenticated(), connInfo.getSecKeySize());
   }
 
   void onDisconnect(NimBLEClient*, int reason) override {
     ESP_LOGI(owner_->tag_, "Disconnected, reason: %d", reason);
 
     owner_->connected_ = false;
+    owner_->connectionPending_ = false;
+    owner_->linkEstablished_ = false;
     owner_->notificationsSubscribed_ = false;
     owner_->service_ = nullptr;
     owner_->notifyChar_ = nullptr;
@@ -179,6 +229,8 @@ void S3XYDevice::cleanupClient() {
   idChar_ = nullptr;
   connected_ = false;
   notificationsSubscribed_ = false;
+  connectionPending_ = false;
+  linkEstablished_ = false;
 }
 
 void S3XYDevice::loadSavedMac() {
@@ -248,8 +300,8 @@ NimBLEAdvertisedDevice* S3XYDevice::findByAddress(const char* address) {
   DeviceLocatorCallbacks callbacks(this, address);
   scan->setScanCallbacks(&callbacks);
 
-  // Blocks for max 5 seconds; exits instantly if callbacks call stop()
-  scan->start(5000, false);
+  // Blocks for max 5 seconds; exits instantly if callbacks call stop().
+  scan->getResults(5000, false);
 
   scan->setScanCallbacks(nullptr);
   scan->clearResults();
@@ -269,7 +321,7 @@ NimBLEAdvertisedDevice* S3XYDevice::findByNameOrService() {
   scan->setScanCallbacks(&callbacks);
 
   // Scan up to 5 sec to catch slow background advertisements
-  scan->start(5000, false);
+  scan->getResults(5000, false);
 
   scan->setScanCallbacks(nullptr);
   scan->clearResults();
@@ -282,6 +334,12 @@ NimBLEAdvertisedDevice* S3XYDevice::findByNameOrService() {
 // ============================================================
 
 bool S3XYDevice::connectToDevice() {
+  uint32_t stageStartedAt = millis();
+  if (connectionPending_) {
+    if (!linkEstablished_) return true;
+    connectionPending_ = false;
+    ESP_LOGI(tag_, "GATT link ready; starting service discovery");
+  } else {
   cleanupClient();
 
   NimBLEAdvertisedDevice* device = nullptr;
@@ -303,7 +361,6 @@ bool S3XYDevice::connectToDevice() {
 
   // A scan can still be completing internally when start() returns.
   // Stop it explicitly before asking NimBLE to create a connection.
-  uint32_t stageStartedAt = millis();
   NimBLEDevice::getScan()->stop();
   delay_ms(200);
   ESP_LOGI(tag_, "scan shutdown took %lu ms", millis() - stageStartedAt);
@@ -321,8 +378,8 @@ bool S3XYDevice::connectToDevice() {
   client_->setClientCallbacks(new DeviceClientCallbacks(this));
 
   stageStartedAt = millis();
-  bool didConnect = client_->connect(device);
-  ESP_LOGI(tag_, "connect/bond took %lu ms", millis() - stageStartedAt);
+  bool didConnect = client_->connect(device, true, true, false);
+  ESP_LOGI(tag_, "async connect request took %lu ms", millis() - stageStartedAt);
 
   if (!didConnect) {
     ESP_LOGI(tag_, "Connection failed");
@@ -330,6 +387,12 @@ bool S3XYDevice::connectToDevice() {
     delete device;
     cleanupClient();
     return false;
+  }
+
+  saveMac(device->getAddress());
+  delete device;
+  connectionPending_ = true;
+  return true;
   }
 
   ESP_LOGI(tag_, "GATT connected");
@@ -347,7 +410,6 @@ bool S3XYDevice::connectToDevice() {
 
     client_->disconnect();
     cleanupClient();
-    delete device;
     return false;
   }
 
@@ -366,7 +428,6 @@ bool S3XYDevice::connectToDevice() {
 
     client_->disconnect();
     cleanupClient();
-    delete device;
     return false;
   }
 
@@ -383,7 +444,6 @@ bool S3XYDevice::connectToDevice() {
 
     client_->disconnect();
     cleanupClient();
-    delete device;
     return false;
   }
 
@@ -414,12 +474,8 @@ bool S3XYDevice::connectToDevice() {
 
     client_->disconnect();
     cleanupClient();
-    delete device;
     return false;
   }
-
-  saveMac(device->getAddress());
-  delete device;
 
   connected_ = true;
   return true;
@@ -455,6 +511,11 @@ void S3XYDevice::loop() {
     } else {
       return;
     }
+  }
+
+  if (connectionPending_ || linkEstablished_) {
+    connectToDevice();
+    return;
   }
 
   if (millis() < nextScanTime_)
