@@ -1,3 +1,4 @@
+#include <cstring>
 #include "NimBLEDevice.h"
 #include "nvs_flash.h"
 #include "esp_log.h"
@@ -8,7 +9,7 @@
 #include "S3XYButton.h"
 #include "S3XYDeviceManager.h"
 #include "S3XYDeviceProfile.h"
-#include "S3XYStalkInput.h"
+#include "S3XYProtocol.h"
 #include "Led.h"
 
 static const char* TAG = "main";
@@ -20,13 +21,51 @@ Led led(LED_PIN, false, true);
 
 // ----- Notification callbacks -----
 
-static void onStalkNotify(const uint8_t* data, size_t len) {
-  s3xy_stalk_input_handle_notify(data, len);
+static void onStalkNotify(S3XYDevice& device, const uint8_t* data, size_t len) {
+  DecodedStalkPacket packet;
+  if (!decodeStalkPacket(data, len, &packet)) {
+    ESP_LOGD("stalk_notify", "[%s] Unhandled packet (%u bytes)", device.tag(), (unsigned)len);
+    return;
+  }
+
+  ESP_LOGI("stalk_notify", "[%s] Switch %s: Event %s (t=%lu)",
+           device.tag(),
+           stalkSwitchToString(packet.sw),
+           stalkEventToString(packet.event),
+           (unsigned long)packet.timestamp);
+
+  // Forward interpreted actions to virtual button (temporary until CAN bus integration)
+  if (s3xy_ready()) {
+    if (packet.event == StalkEvent::Action_Single) {
+      s3xy_send_single();
+      ESP_LOGI(TAG, "Forwarded single press from %s", device.tag());
+    } else if (packet.event == StalkEvent::Action_Double) {
+      s3xy_send_double();
+      ESP_LOGI(TAG, "Forwarded double press from %s", device.tag());
+    } else if (packet.event == StalkEvent::Action_Long) {
+      s3xy_send_long();
+      ESP_LOGI(TAG, "Forwarded long press from %s", device.tag());
+    }
+  }
 }
 
-static void onButtonNotify(const uint8_t* data, size_t len) {
-  ESP_LOGI("btn_notify", "RX %u bytes", (unsigned)len);
-  ESP_LOG_BUFFER_HEX("btn_notify", data, len);
+static void onButtonNotify(S3XYDevice& device, const uint8_t* data, size_t len) {
+  DecodedButtonPacket packet;
+  if (!decodeButtonPacket(data, len, &packet)) {
+    ESP_LOGD("btn_notify", "[%s] Unhandled packet (%u bytes)", device.tag(), (unsigned)len);
+    return;
+  }
+
+  ESP_LOGI("btn_notify", "[%s] Event %s (t=%lu)",
+           device.tag(),
+           buttonEventToString(packet.event),
+           (unsigned long)packet.timestamp);
+
+  // Flash the LED on single press (off for 200 ms, no repeat)
+  if (packet.event == ButtonEvent::Press) {
+    ESP_LOGI("btn_notify", "[%s] Press event detected -> flashing LED", device.tag());
+    led.runLed({{0, false}, {200, true}}, 0);
+  }
 }
 
 // ----- Device profiles -----
@@ -63,6 +102,11 @@ static void onCommanderDisconnected() {
 // ----- LED state machine -----
 
 static void updateLed() {
+  if (led.isRunning() && !led.isRepeating()) {
+    // One-shot pattern (such as a flash) is in progress; do not overwrite it.
+    return;
+  }
+
   if (manager.isPairing()) {
     // Fast blink — pairing mode
     led.runLed({{0, true}, {100, false}}, 1000);
@@ -103,24 +147,6 @@ static void main_task(void* pvParameters) {
     s3xy_loop();
     manager.loop();
     updateLed();
-
-    // Process stalk input actions → forward to virtual button
-    S3XYButtonAction action;
-    while (s3xy_stalk_input_dequeue_action(&action)) {
-      if (s3xy_ready()) {
-        if (action == S3XYButtonAction::Single) {
-          s3xy_send_single();
-          ESP_LOGI(TAG, "Forwarded single press");
-        } else if (action == S3XYButtonAction::Double) {
-          s3xy_send_double();
-          ESP_LOGI(TAG, "Forwarded double press");
-        } else if (action == S3XYButtonAction::Long) {
-          s3xy_send_long();
-          ESP_LOGI(TAG, "Forwarded long press");
-        }
-      }
-    }
-
     delay_ms(10);  // yield to FreeRTOS
   }
 }

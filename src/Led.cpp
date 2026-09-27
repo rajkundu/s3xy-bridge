@@ -149,6 +149,11 @@ void Led::runLed(const LedPattern& pattern, unsigned long cycleDuration) {
     return;
   }
 
+  if (cycleDuration > 0) {
+    repeatingStates_.assign(pattern.begin(), pattern.end());
+    repeatingCycleDuration_ = cycleDuration;
+  }
+
   states_.assign(pattern.begin(), pattern.end());
   stepCount_ = states_.size();
   currentStep_ = 0;
@@ -164,6 +169,8 @@ void Led::runLed(const LedPattern& pattern, unsigned long cycleDuration) {
 
 void Led::set(bool on) {
   running_ = false;
+  repeatingCycleDuration_ = 0;
+  repeatingStates_.clear();
   if (LED_DEBUG) {
     ESP_LOGD(TAG, "set %s", on ? "on" : "off");
   }
@@ -228,6 +235,20 @@ void Led::update() {
 
 void Led::finishPattern() {
   running_ = false;
+  if (repeatingCycleDuration_ > 0 && !repeatingStates_.empty()) {
+    states_ = repeatingStates_;
+    stepCount_ = states_.size();
+    currentStep_ = 0;
+    patternStartedAt_ = millis();
+    cycleDuration_ = repeatingCycleDuration_;
+    running_ = true;
+    if (LED_DEBUG) {
+      ESP_LOGD(TAG, "reinstating repeating pattern");
+    }
+    update();
+    return;
+  }
+
   if (LED_DEBUG) {
     ESP_LOGD(TAG, "pattern finished");
   }

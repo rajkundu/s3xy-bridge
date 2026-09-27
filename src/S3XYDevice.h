@@ -13,7 +13,7 @@
 /// this, so no extra init is needed when both are used together.
 class S3XYDevice {
  public:
-  using NotifyCallback = void (*)(const uint8_t* data, size_t len);
+  using NotifyCallback = void (*)(S3XYDevice& device, const uint8_t* data, size_t len);
 
   /// @param tag       Unique label for this device instance.  Used as the NVS
   ///                  key (with a "mac_" prefix) and as the log prefix.

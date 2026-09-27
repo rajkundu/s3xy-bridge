@@ -52,7 +52,7 @@ void S3XYDevice::notifyTrampoline(
   printHex(self->tag_, data, length, isNotify);
 
   if (self->notifyCallback_) {
-    self->notifyCallback_(data, length);
+    self->notifyCallback_(*self, data, length);
   }
 }
 

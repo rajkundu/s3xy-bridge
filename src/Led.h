@@ -45,6 +45,8 @@ class Led {
   size_t currentStep_ = 0;
   unsigned long patternStartedAt_ = 0;
   unsigned long cycleDuration_ = 0;
+  std::vector<LedState> repeatingStates_;
+  unsigned long repeatingCycleDuration_ = 0;
   bool running_ = false;
   esp_timer_handle_t ticker_ = nullptr;
 };
