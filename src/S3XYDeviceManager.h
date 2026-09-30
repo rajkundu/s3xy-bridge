@@ -12,8 +12,9 @@
 /// A configurable GPIO button triggers pairing mode (scan for new devices)
 /// or unpair-all (longer hold).
 class S3XYDeviceManager {
-  // Grant PairingLocatorCallbacks access to private members
+  // Grant callbacks access to private members
   friend class PairingLocatorCallbacks;
+  friend class ManagerInitiatorCallbacks;
 
  public:
   static constexpr size_t MAX_DEVICES = 3;
@@ -42,10 +43,16 @@ class S3XYDeviceManager {
   bool isPairing() const { return pairingMode_; }
   bool anyReady() const;
   bool allReady() const;
+  size_t numReady() const;
 
   // ----- Singleton Accessor & Lookup -----
   static S3XYDeviceManager* instance();
   S3XYDevice* findDeviceByMac(const std::string& mac) const;
+
+  // ----- Reconnection Events -----
+  void onDeviceDisconnected(S3XYDevice* dev);
+  void detachInitiatorClient();
+  void onInitiatorExpired();
 
   // ----- Unpairing -----
   void unpairAll();
@@ -79,8 +86,19 @@ class S3XYDeviceManager {
   bool pairingJustEntered_ = false;
   size_t pairingCandidateIndex_ = MAX_DEVICES;
   std::set<std::string> pairingLoggedAddresses_;
-  void updateBackgroundScan();
+
+  // Reconnection management
+  NimBLEClient* initiatorClient_ = nullptr;
+  NimBLEClientCallbacks* initiatorCallbacks_ = nullptr;
+  bool whitelistInitiatorActive_ = false;
+  uint32_t initiatorStartTime_ = 0;
+  bool fallbackToScan_ = false;
   uint32_t nextReconnectScanTime_ = 0;
+
+  void updateReconnection();
+  bool startWhitelistInitiator();
+  void stopWhitelistInitiator();
+  void updateBackgroundScan();
 
   // Button input
   void checkPairButton();

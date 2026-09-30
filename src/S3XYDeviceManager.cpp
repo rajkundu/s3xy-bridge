@@ -7,9 +7,62 @@
 #include "nvs.h"
 
 #include <cstring>
+#include <strings.h>
 #include <cstdio>
 
 static const char* TAG = "manager";
+
+static inline uint8_t inferAddressType(const std::string& mac) {
+  if (mac.length() >= 2) {
+    char hexStr[3] = { mac[0], mac[1], '\0' };
+    unsigned long firstByte = strtoul(hexStr, nullptr, 16);
+    if ((firstByte & 0xC0) == 0xC0) {
+      return BLE_ADDR_RANDOM;
+    }
+  }
+  return BLE_ADDR_PUBLIC;
+}
+
+// ============================================================
+// Whitelist Initiator Connection Callbacks
+// ============================================================
+class ManagerInitiatorCallbacks : public NimBLEClientCallbacks {
+ public:
+  explicit ManagerInitiatorCallbacks(S3XYDeviceManager* mgr) : mgr_(mgr) {}
+
+  void onConnect(NimBLEClient* pClient) override {
+    NimBLEAddress peer = pClient->getPeerAddress();
+    std::string mac = peer.toString();
+    ESP_LOGI(TAG, "Whitelist initiator connected to %s", mac.c_str());
+
+    S3XYDevice* targetDev = mgr_->findDeviceByMac(mac);
+
+    if (targetDev && !targetDev->connected()) {
+      mgr_->detachInitiatorClient();
+      targetDev->attachClient(pClient);
+      NimBLEDevice::whiteListRemove(peer);
+      mgr_->fallbackToScan_ = false;
+    } else {
+      ESP_LOGW(TAG, "Whitelist connected to unexpected/already-connected peer %s, disconnecting", mac.c_str());
+      pClient->disconnect();
+      mgr_->detachInitiatorClient();
+      NimBLEDevice::deleteClient(pClient);
+    }
+  }
+
+  void onConnectFail(NimBLEClient* pClient, int reason) override {
+    ESP_LOGI(TAG, "Whitelist initiator attempt ended/timed out (reason: %d)", reason);
+    bool wasActive = (mgr_->initiatorClient_ == pClient);
+    mgr_->initiatorClient_ = nullptr;
+    mgr_->whitelistInitiatorActive_ = false;
+    if (wasActive) {
+      mgr_->onInitiatorExpired();
+    }
+  }
+
+ private:
+  S3XYDeviceManager* mgr_;
+};
 
 // ============================================================
 // Shared Non-Blocking Reconnect Scan Callback
@@ -25,16 +78,18 @@ class ReconnectScanCallbacks : public NimBLEScanCallbacks {
 
     for (size_t i = 0; i < mgr_->deviceCount(); ++i) {
       S3XYDevice* dev = mgr_->device(i);
-      if (!dev || dev->connected() || dev->connecting()) {
+      if (!dev || dev->connected() || dev->connecting() || dev->hasTargetDevice()) {
         continue;
       }
 
-      if (dev->mac() == mac) {
-        if (!dev->hasTargetDevice()) {
-          ESP_LOGI(TAG, "Scan matched saved device [%u] (%s)",
-                   (unsigned)i, mac.c_str());
-          dev->setTargetDevice(*advertisedDevice);
-        }
+      if (dev->mac().empty()) {
+        continue;
+      }
+
+      if (strcasecmp(mac.c_str(), dev->mac().c_str()) == 0) {
+        ESP_LOGI(TAG, "Scan matched saved device [%u] (%s)",
+                 (unsigned)i, dev->mac().c_str());
+        dev->setTargetDevice(*advertisedDevice);
         // Stop scan immediately so main loop can initiate connection right away
         NimBLEDevice::getScan()->stop();
         return;
@@ -141,12 +196,37 @@ S3XYDeviceManager::S3XYDeviceManager(const S3XYDeviceProfile* profiles,
   if (!s_reconnectCallbacks) {
     s_reconnectCallbacks = new ReconnectScanCallbacks(this);
   }
+  initiatorCallbacks_ = new ManagerInitiatorCallbacks(this);
 }
 
 S3XYDeviceManager::~S3XYDeviceManager() {
+  stopWhitelistInitiator();
+  delete initiatorCallbacks_;
+  initiatorCallbacks_ = nullptr;
   if (s_instance == this) s_instance = nullptr;
   for (size_t i = 0; i < deviceCount_; ++i) {
     freeDevice(i);
+  }
+}
+
+void S3XYDeviceManager::detachInitiatorClient() {
+  initiatorClient_ = nullptr;
+  whitelistInitiatorActive_ = false;
+}
+
+void S3XYDeviceManager::onInitiatorExpired() {
+  ESP_LOGI(TAG, "Whitelist initiator window expired -> falling back to background scan");
+  initiatorClient_ = nullptr;
+  whitelistInitiatorActive_ = false;
+  fallbackToScan_ = true;
+  nextReconnectScanTime_ = millis();
+}
+
+void S3XYDeviceManager::onDeviceDisconnected(S3XYDevice* dev) {
+  ESP_LOGI(TAG, "Device [%s] disconnected -> refreshing reconnection", dev ? dev->tag() : "?");
+  fallbackToScan_ = false;
+  if (whitelistInitiatorActive_) {
+    stopWhitelistInitiator();
   }
 }
 
@@ -180,6 +260,90 @@ void S3XYDeviceManager::begin(gpio_num_t pairPin,
   }
 }
 
+bool S3XYDeviceManager::startWhitelistInitiator() {
+  if (whitelistInitiatorActive_) return true;
+
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  if (scan->isScanning()) {
+    scan->stop();
+  }
+
+  // Remove any already-connected or currently-connecting devices from whitelist
+  for (size_t i = 0; i < deviceCount_; ++i) {
+    S3XYDevice* dev = devices_[i];
+    if (dev && (dev->connected() || dev->connecting()) && !dev->mac().empty()) {
+      uint8_t addrType = inferAddressType(dev->mac());
+      NimBLEAddress addr(dev->mac(), addrType);
+      if (NimBLEDevice::onWhiteList(addr)) {
+        NimBLEDevice::whiteListRemove(addr);
+      }
+    }
+  }
+
+  // Ensure all disconnected saved devices are in the whitelist
+  size_t count = 0;
+  for (size_t i = 0; i < deviceCount_; ++i) {
+    S3XYDevice* dev = devices_[i];
+    if (!dev || dev->connected() || dev->connecting() || dev->mac().empty()) {
+      continue;
+    }
+    uint8_t addrType = inferAddressType(dev->mac());
+    NimBLEAddress addr(dev->mac(), addrType);
+    if (NimBLEDevice::onWhiteList(addr) || NimBLEDevice::whiteListAdd(addr)) {
+      ESP_LOGI(TAG, "Whitelist active for [%s] %s (type %u)", dev->tag(), dev->mac().c_str(), addrType);
+      count++;
+    } else {
+      ESP_LOGW(TAG, "Failed adding [%s] %s to whitelist", dev->tag(), dev->mac().c_str());
+    }
+  }
+
+  if (count == 0) {
+    return false;
+  }
+
+  initiatorClient_ = NimBLEDevice::createClient();
+  if (!initiatorClient_) {
+    ESP_LOGE(TAG, "Failed to create BLE initiator client");
+    return false;
+  }
+
+  // 15 ms initial connection interval (12 * 1.25ms) for fast, reliable connection establishment
+  // and rapid GATT discovery (80 ms) without 0x3e connection aborts.
+  // scan_itvl=24 (15 ms), window=22 (13.75 ms) gives 91.7% duty cycle for maximum probability
+  // of catching the S3XY button's 1.5 ms burst on its very first 2.56s cycle.
+  initiatorClient_->setConnectionParams(12, 12, 0, 200, 24, 22);
+  initiatorClient_->setConnectTimeout(8000);
+  initiatorClient_->setSelfDelete(false, true);
+  initiatorClient_->setClientCallbacks(initiatorCallbacks_, false);
+
+  initiatorStartTime_ = millis();
+  whitelistInitiatorActive_ = true;
+  ESP_LOGI(TAG, "Starting whitelist initiator for %u device(s) (timeout=8000 ms, 91.7%% duty cycle)", (unsigned)count);
+
+  bool ok = initiatorClient_->connect(NimBLEAddress(), true, true, false);
+  if (!ok) {
+    ESP_LOGW(TAG, "Whitelist initiator connect request failed");
+    whitelistInitiatorActive_ = false;
+    NimBLEDevice::deleteClient(initiatorClient_);
+    initiatorClient_ = nullptr;
+    return false;
+  }
+
+  return true;
+}
+
+void S3XYDeviceManager::stopWhitelistInitiator() {
+  if (whitelistInitiatorActive_ && initiatorClient_) {
+    ESP_LOGI(TAG, "Stopping active whitelist initiator");
+    whitelistInitiatorActive_ = false;
+    NimBLEClient* client = initiatorClient_;
+    initiatorClient_ = nullptr;
+    client->cancelConnect();
+  }
+  whitelistInitiatorActive_ = false;
+  initiatorClient_ = nullptr;
+}
+
 void S3XYDeviceManager::updateBackgroundScan() {
   NimBLEScan* scan = NimBLEDevice::getScan();
 
@@ -205,7 +369,7 @@ void S3XYDeviceManager::updateBackgroundScan() {
     }
   }
 
-  if (!anyDisconnected || anyInitiating || anyTargetReady) {
+  if (!anyDisconnected || anyInitiating || anyTargetReady || !fallbackToScan_) {
     if (scan->isScanning()) {
       scan->stop();
     }
@@ -214,21 +378,94 @@ void S3XYDeviceManager::updateBackgroundScan() {
 
   if (!scan->isScanning() && millis() >= nextReconnectScanTime_) {
     scan->clearResults();
-    scan->setScanCallbacks(s_reconnectCallbacks, false);
+    scan->setScanCallbacks(s_reconnectCallbacks, true);
     scan->setActiveScan(false);
 
-    // Use aggressive 80% duty cycle when no devices are connected OR during
-    // the first 30 seconds after boot until all devices have connected.
-    if (!anyConnected || millis() < 30000) {
-      scan->setInterval(100);
-      scan->setWindow(80);
-    } else {
+    if (anyConnected) {
+      // Gentle 30% duty cycle (window 48 * 0.625ms = 30ms, interval 160 * 0.625ms = 100ms)
+      // for 1500 ms, followed by a 3500 ms quiet period.
+      // This leaves >90% average radio airtime for active connections and virtual button
+      // advertising, completely preventing LL response timeouts (reason: 546).
       scan->setInterval(160);
-      scan->setWindow(40);
+      scan->setWindow(48);
+      scan->start(1500, false, false);
+      nextReconnectScanTime_ = millis() + 5000;
+    } else {
+      // No devices connected yet: scan with 75% duty cycle for 2000 ms, 500 ms quiet
+      scan->setInterval(160);
+      scan->setWindow(120);
+      scan->start(2000, false, false);
+      nextReconnectScanTime_ = millis() + 2500;
     }
+  }
+}
 
-    scan->start(4000, false, false);
-    nextReconnectScanTime_ = millis() + 4100;
+void S3XYDeviceManager::updateReconnection() {
+  if (pairingMode_) return;
+
+  size_t disconnectedKnownCount = 0;
+  bool anyInitiating = false;
+  bool anyHasTarget = false;
+
+  for (size_t i = 0; i < deviceCount_; ++i) {
+    S3XYDevice* dev = devices_[i];
+    if (!dev) continue;
+
+    if (!dev->connected()) {
+      if (!dev->mac().empty() && !dev->connecting() && !dev->hasTargetDevice()) {
+        disconnectedKnownCount++;
+      }
+      if (dev->initiating()) {
+        anyInitiating = true;
+      }
+      if (dev->hasTargetDevice()) {
+        anyHasTarget = true;
+      }
+    }
+  }
+
+  // If all known devices are connected:
+  if (disconnectedKnownCount == 0 && !anyInitiating && !anyHasTarget) {
+    stopWhitelistInitiator();
+    NimBLEScan* scan = NimBLEDevice::getScan();
+    if (scan->isScanning()) {
+      scan->stop();
+    }
+    fallbackToScan_ = false;
+    return;
+  }
+
+  // If any device has a target from scan or is initiating direct connect:
+  if (anyHasTarget || anyInitiating) {
+    if (whitelistInitiatorActive_) {
+      stopWhitelistInitiator();
+    }
+    return;
+  }
+
+  // Fallback scan mode when whitelist initiator has timed out for remaining devices:
+  if (fallbackToScan_) {
+    updateBackgroundScan();
+    return;
+  }
+
+  // Whitelist initiator mode:
+  if (whitelistInitiatorActive_) {
+    // NimBLE does not enforce connectTimeout for asynchronous connections.
+    // Enforce an 8-second software timeout so missing devices (e.g. dev_0) do not
+    // lock the radio in the high-duty-cycle Initiating State indefinitely.
+    if (millis() - initiatorStartTime_ >= 8000) {
+      ESP_LOGI(TAG, "Whitelist initiator window expired (8000 ms) -> switching to background scan");
+      stopWhitelistInitiator();
+      onInitiatorExpired();
+      return;
+    }
+  }
+
+  if (!whitelistInitiatorActive_ && disconnectedKnownCount > 0) {
+    if (!startWhitelistInitiator()) {
+      fallbackToScan_ = true;
+    }
   }
 }
 
@@ -273,43 +510,13 @@ void S3XYDeviceManager::loop() {
     return;
   }
 
-  // Normal mode:
-  // 1. Manage the single shared non-blocking scanner
-  updateBackgroundScan();
+  // Normal mode: central-managed whitelist reconnection
+  updateReconnection();
 
-  // 2. Check if any device is currently in the GAP connection-initiation phase.
-  //    Once `onConnect` fires (`linkEstablished_`), the GAP initiator is free,
-  //    so the next device can start its 2 ms async connect() in parallel with
-  //    the current device's GATT discovery.
-  bool initiatorBusy = false;
+  // Tick all devices so they can run GATT discovery and monitor connection status
   for (size_t i = 0; i < deviceCount_; ++i) {
-    if (devices_[i] && devices_[i]->initiating()) {
-      initiatorBusy = true;
-      break;
-    }
-  }
-
-  // 3. First pass: if the GAP initiator is free, kick off the next queued
-  //    device's async connect() BEFORE any blocking GATT discovery runs.
-  if (!initiatorBusy) {
-    for (size_t i = 0; i < deviceCount_; ++i) {
-      S3XYDevice* dev = devices_[i];
-      if (dev && !dev->connected() && !dev->connecting() && dev->hasTargetDevice()) {
-        dev->loop();
-        if (dev->connecting()) {
-          initiatorBusy = true;
-          break;
-        }
-      }
-    }
-  }
-
-  // 4. Second pass: tick already-connected devices and any device whose
-  //    link is established and needs to finish GATT service discovery.
-  for (size_t i = 0; i < deviceCount_; ++i) {
-    S3XYDevice* dev = devices_[i];
-    if (dev && (dev->connected() || dev->connecting())) {
-      dev->loop();
+    if (devices_[i]) {
+      devices_[i]->loop();
     }
   }
 }
@@ -321,7 +528,7 @@ S3XYDevice* S3XYDeviceManager::device(size_t index) const {
 
 S3XYDevice* S3XYDeviceManager::findDeviceByMac(const std::string& mac) const {
   for (size_t i = 0; i < deviceCount_; ++i) {
-    if (devices_[i] && devices_[i]->mac() == mac) {
+    if (devices_[i] && strcasecmp(devices_[i]->mac().c_str(), mac.c_str()) == 0) {
       return devices_[i];
     }
   }
@@ -337,10 +544,17 @@ bool S3XYDeviceManager::anyReady() const {
 
 bool S3XYDeviceManager::allReady() const {
   if (deviceCount_ == 0) return false;
+  return numReady() == deviceCount_;
+}
+
+size_t S3XYDeviceManager::numReady() const {
+  size_t count = 0;
   for (size_t i = 0; i < deviceCount_; ++i) {
-    if (!devices_[i] || !devices_[i]->ready()) return false;
+    if (devices_[i] && devices_[i]->ready()) {
+      count++;
+    }
   }
-  return true;
+  return count;
 }
 
 // ============================================================
@@ -376,6 +590,7 @@ void S3XYDeviceManager::checkPairButton() {
 // ============================================================
 
 void S3XYDeviceManager::enterPairingMode() {
+  stopWhitelistInitiator();
   if (NimBLEDevice::getScan()->isScanning()) {
     NimBLEDevice::getScan()->stop();
   }
@@ -390,6 +605,7 @@ void S3XYDeviceManager::enterPairingMode() {
 void S3XYDeviceManager::exitPairingMode() {
   pairingMode_ = false;
   nextReconnectScanTime_ = 0;
+  fallbackToScan_ = false;
   ESP_LOGI(TAG, "Exiting pairing mode");
 }
 
@@ -541,7 +757,20 @@ void S3XYDeviceManager::freeDevice(size_t index) {
 }
 
 void S3XYDeviceManager::unpairAll() {
-  ESP_LOGW(TAG, "Unpairing all %u device(s)", (unsigned)deviceCount_);
+  ESP_LOGW(TAG, "Unpairing all %u device(s) and clearing BLE bonds", (unsigned)deviceCount_);
+
+  stopWhitelistInitiator();
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  if (scan->isScanning()) {
+    scan->stop();
+  }
+  while (NimBLEDevice::getWhiteListCount() > 0) {
+    NimBLEDevice::whiteListRemove(NimBLEDevice::getWhiteListAddress(0));
+  }
+  fallbackToScan_ = false;
+
+  // Clear all stored BLE bonds from NimBLE NVS
+  NimBLEDevice::deleteAllBonds();
 
   for (size_t i = 0; i < deviceCount_; ++i) {
     // Clear the device's own NVS MAC
@@ -568,6 +797,9 @@ void S3XYDeviceManager::unpair(size_t index) {
 
   ESP_LOGI(TAG, "Unpairing device %u [%s]", (unsigned)index,
            tags_[index] ? tags_[index] : "?");
+
+  stopWhitelistInitiator();
+  fallbackToScan_ = false;
 
   if (devices_[index]) {
     devices_[index]->clearSavedMac();

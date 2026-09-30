@@ -29,7 +29,7 @@ CONFIG_BT_CTRL_BLE_MAX_ACT=6
 # NimBLE host task stack (callbacks do GATT discovery, need room)
 CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192
 
-# Squelch verbose NimBLE GATT spam at INFO level
+# NimBLE log level
 CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
 
 # NVS

@@ -28,12 +28,6 @@ static void printHex(const char* tag, const uint8_t* data, size_t len, bool isNo
   ESP_LOGI(tag, "RX %s: %s", isNotify ? "notify" : "indicate", buf);
 }
 
-static uint8_t inferAddressType(const std::string& mac) {
-  if (mac.length() < 2) return BLE_ADDR_PUBLIC;
-  unsigned long firstByte = strtoul(mac.c_str(), nullptr, 16);
-  return ((firstByte & 0xC0) == 0xC0) ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
-}
-
 // ============================================================
 // Notification trampoline
 // ============================================================
@@ -65,37 +59,14 @@ class DeviceClientCallbacks : public NimBLEClientCallbacks {
   explicit DeviceClientCallbacks(S3XYDevice* owner) : owner_(owner) {}
 
   void onConnect(NimBLEClient* pClient) override {
-    NimBLEAddress peer = pClient->getPeerAddress();
-    std::string peerMac = peer.toString();
+    owner_->linkEstablished_ = true;
 
-    S3XYDevice* actualOwner = owner_;
-    if (S3XYDeviceManager::instance()) {
-      S3XYDevice* matched = S3XYDeviceManager::instance()->findDeviceByMac(peerMac);
-      if (matched && matched != owner_) {
-        ESP_LOGI(owner_->tag_, "Whitelist matched %s -> routing to %s",
-                 peerMac.c_str(), matched->tag());
-        actualOwner = matched;
-        actualOwner->client_ = pClient;
-        actualOwner->connectionPending_ = true;
-        owner_->client_ = nullptr;
-        owner_->connectionPending_ = false;
-        owner_->linkEstablished_ = false;
-        owner_->directConnectPending_ = true;
-        owner_ = actualOwner;
-      }
-    }
-
-    actualOwner->linkEstablished_ = true;
-    actualOwner->directConnectRetries_ = 0;
-    actualOwner->directConnectPending_ = false;
-
-    // Remove connected peer from controller whitelist while connected
-    NimBLEDevice::whiteListRemove(peer);
-
-    NimBLEConnInfo info = actualOwner->client_->getConnInfo();
-    ESP_LOGI(actualOwner->tag_,
-             "Connection established: interval=%.2f ms latency=%u timeout=%u ms; "
+    NimBLEConnInfo info = owner_->client_->getConnInfo();
+    uint32_t elapsed = millis() - owner_->connectStartTime_;
+    ESP_LOGI(owner_->tag_,
+             "Connection established after %lu ms: interval=%.2f ms latency=%u timeout=%u ms; "
              "waiting for security/authentication",
+             elapsed,
              info.getConnInterval() * 1.25f, info.getConnLatency(),
              info.getConnTimeout() * 10);
   }
@@ -112,13 +83,15 @@ class DeviceClientCallbacks : public NimBLEClientCallbacks {
   }
 
   void onConnectFail(NimBLEClient*, int reason) override {
+    uint32_t elapsed = millis() - owner_->connectStartTime_;
     owner_->connectionPending_ = false;
     owner_->linkEstablished_ = false;
-    owner_->directConnectPending_ = true;
+    delete owner_->targetDevice_;
+    owner_->targetDevice_ = nullptr;
     owner_->nextScanTime_ = millis() + 500;
     ESP_LOGW(owner_->tag_,
-             "Whitelist connection attempt timed out/failed, reason: %d (will retry)",
-             reason);
+             "Connection attempt timed out/failed after %lu ms, reason: %d (will resume scanning)",
+             elapsed, reason);
   }
 
   void onPassKeyEntry(NimBLEConnInfo& connInfo) override {
@@ -156,13 +129,13 @@ class DeviceClientCallbacks : public NimBLEClientCallbacks {
     owner_->notifyChar_ = nullptr;
     owner_->idChar_ = nullptr;
 
-    owner_->directConnectRetries_ = 0;
-    owner_->directConnectPending_ = !owner_->savedMac_.empty();
+    delete owner_->targetDevice_;
+    owner_->targetDevice_ = nullptr;
     owner_->nextScanTime_ = millis() + 100;
 
-    if (!owner_->savedMac_.empty()) {
-      uint8_t addrType = inferAddressType(owner_->savedMac_);
-      NimBLEDevice::whiteListAdd(NimBLEAddress(owner_->savedMac_, addrType));
+    S3XYDeviceManager* mgr = S3XYDeviceManager::instance();
+    if (mgr) {
+      mgr->onDeviceDisconnected(owner_);
     }
   }
 
@@ -199,7 +172,25 @@ void S3XYDevice::setTargetDevice(const NimBLEAdvertisedDevice& device) {
   NimBLEAdvertisedDevice* copy = new NimBLEAdvertisedDevice(device);
   NimBLEAdvertisedDevice* old = targetDevice_;
   targetDevice_ = copy;
+  nextScanTime_ = 0;
   delete old;
+}
+
+void S3XYDevice::attachClient(NimBLEClient* client) {
+  cleanupClient();
+  client_ = client;
+  client_->setSelfDelete(false, false);
+  client_->setClientCallbacks(new DeviceClientCallbacks(this), true);
+  linkEstablished_ = true;
+  connectionPending_ = true;
+  connectStartTime_ = millis();
+  saveMac(client_->getPeerAddress());
+
+  NimBLEConnInfo info = client_->getConnInfo();
+  ESP_LOGI(tag_,
+           "Client attached via whitelist: interval=%.2f ms latency=%u timeout=%u ms",
+           info.getConnInterval() * 1.25f, info.getConnLatency(),
+           info.getConnTimeout() * 10);
 }
 
 void S3XYDevice::cleanupClient() {
@@ -240,11 +231,7 @@ void S3XYDevice::loadSavedMac() {
   }
 
   if (!savedMac_.empty()) {
-    directConnectRetries_ = 0;
-    directConnectPending_ = true;
     ESP_LOGI(tag_, "Loaded saved MAC: %s", savedMac_.c_str());
-    uint8_t addrType = inferAddressType(savedMac_);
-    NimBLEDevice::whiteListAdd(NimBLEAddress(savedMac_, addrType));
   }
 }
 
@@ -268,13 +255,9 @@ void S3XYDevice::saveMac(const NimBLEAddress& address) {
 }
 
 void S3XYDevice::clearSavedMac() {
-  if (!savedMac_.empty()) {
-    uint8_t addrType = inferAddressType(savedMac_);
-    NimBLEDevice::whiteListRemove(NimBLEAddress(savedMac_, addrType));
-  }
   savedMac_ = "";
-  directConnectPending_ = false;
-  directConnectRetries_ = 0;
+  delete targetDevice_;
+  targetDevice_ = nullptr;
 
   nvs_handle_t handle;
   if (nvs_open("s3xy", NVS_READWRITE, &handle) == ESP_OK) {
@@ -297,13 +280,12 @@ bool S3XYDevice::connectToDevice() {
     connectionPending_ = false;
     ESP_LOGI(tag_, "GATT link ready; starting service discovery");
   } else {
-    if (!targetDevice_ && (!directConnectPending_ || savedMac_.empty())) {
+    if (!targetDevice_) {
       return false;
     }
 
     NimBLEAdvertisedDevice* device = targetDevice_;
     targetDevice_ = nullptr;
-    directConnectPending_ = false;
 
     cleanupClient();
 
@@ -316,43 +298,30 @@ bool S3XYDevice::connectToDevice() {
     ESP_LOGI(tag_, "create client took %lu ms", millis() - stageStartedAt);
 
     if (!client_) {
-      ESP_LOGI(tag_, "Failed to create BLE client");
+      ESP_LOGE(tag_, "Failed to create BLE client");
       delete device;
       return false;
     }
 
     // 15 ms initial connection interval (12 * 1.25ms) for fast GATT discovery.
-    // Scan interval=24 (15 ms), window=22 (13.75 ms) leaves a 1.25 ms slot for
-    // peripheral advertising and connected peers so the initiator isn't aborted.
+    // scan_itvl=24 (15 ms), window=22 (13.75 ms) gives 91.7% duty cycle.
     client_->setConnectionParams(12, 12, 0, 200, 24, 22);
-    client_->setConnectTimeout(6000);
-
-    // 35-50 ms initial interval (28-40 * 1.25ms) keeps radio interrupts low for
-    // 5.5s while other devices connect. Initiator scan interval=40 (25 ms) and
-    // window=30 (18.75 ms) leaves a 6.25 ms gap per cycle so active connections
-    // and peripheral advertising never preempt the initiator scan window.
-    // client_->setConnectionParams(28, 40, 0, 256, 40, 30);
-    // client_->setConnectTimeout(8000);
+    client_->setConnectTimeout(7000);
     client_->setClientCallbacks(new DeviceClientCallbacks(this));
 
+    connectStartTime_ = millis();
     stageStartedAt = millis();
-    bool didConnect = false;
-    if (device) {
-      ESP_LOGI(tag_, "Connecting to %s (from scan)",
-               device->getAddress().toString().c_str());
-      didConnect = client_->connect(device, true, true, false);
-      if (didConnect) {
-        saveMac(device->getAddress());
-      }
-      delete device;
-    } else {
-      ESP_LOGI(tag_, "Whitelist-connecting (listening for all saved devices)...");
-      didConnect = client_->connect(NimBLEAddress(), true, true, false);
+    ESP_LOGI(tag_, "Connecting to %s (from scan, timeout=7000 ms)",
+             device->getAddress().toString().c_str());
+    bool didConnect = client_->connect(device, true, true, false);
+    if (didConnect) {
+      saveMac(device->getAddress());
     }
+    delete device;
     ESP_LOGI(tag_, "async connect request took %lu ms", millis() - stageStartedAt);
 
     if (!didConnect) {
-      ESP_LOGI(tag_, "Connection failed");
+      ESP_LOGW(tag_, "Connection request failed");
       cleanupClient();
       return false;
     }

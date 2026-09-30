@@ -113,8 +113,8 @@ static void updateLed() {
   } else if (manager.deviceCount() == 0) {
     // Solid OFF — no devices paired
     led.set(false);
-  } else if (manager.allReady()) {
-    // Solid ON — everything connected
+  } else if (manager.allReady() && s3xy_ready()) {
+    // Solid ON — everything connected, INCLUDING Commander (virtual button)
     led.set(true);
   } else {
     // Slow double-blink — not all ready

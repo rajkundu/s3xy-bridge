@@ -61,9 +61,10 @@ class S3XYDevice {
   // ----- NVS -----
   void clearSavedMac();
 
-  // ----- Reconnection -----
+  // ----- Reconnection & Client Attach -----
+  void attachClient(NimBLEClient* client);
   void setTargetDevice(const NimBLEAdvertisedDevice& device);
-  bool hasTargetDevice() const { return targetDevice_ != nullptr || directConnectPending_; }
+  bool hasTargetDevice() const { return targetDevice_ != nullptr; }
   bool initiating() const { return connectionPending_ && !linkEstablished_; }
   bool canAttemptConnect() const;
 
@@ -89,6 +90,7 @@ class S3XYDevice {
     bool connectionPending_ = false;
     bool linkEstablished_ = false;
   uint32_t nextScanTime_ = 0;
+  uint32_t connectStartTime_ = 0;
 
   NotifyCallback notifyCallback_ = nullptr;
   std::string savedMac_;
@@ -99,8 +101,6 @@ class S3XYDevice {
   void saveMac(const NimBLEAddress& address);
 
   NimBLEAdvertisedDevice* targetDevice_ = nullptr;
-  bool directConnectPending_ = false;
-  uint8_t directConnectRetries_ = 0;
   bool connectToDevice();
 
   // BLE callback helpers need access to private members
