@@ -119,7 +119,7 @@ class PairingLocatorCallbacks : public NimBLEScanCallbacks {
     std::string name = advertisedDevice->getName();
     if (name.rfind("ENH_", 0) != 0) return;
 
-    if (!mgr_->pairingLoggedAddresses_.insert(mac).second) return;
+    bool isNewAddr = mgr_->pairingLoggedAddresses_.insert(mac).second;
 
     std::string services;
     for (uint8_t i = 0; i < advertisedDevice->getServiceUUIDCount(); ++i) {
@@ -128,15 +128,19 @@ class PairingLocatorCallbacks : public NimBLEScanCallbacks {
     }
     if (services.empty()) services = "<none>";
 
-    ESP_LOGI(TAG,
-             "Pairing advertisement: name=%s address=%s rssi=%d services=%s "
-             "connectable=%d scannable=%d",
-             name.c_str(), mac.c_str(), advertisedDevice->getRSSI(),
-             services.c_str(), advertisedDevice->isConnectable(),
-             advertisedDevice->isScannable());
+    if (isNewAddr) {
+      ESP_LOGI(TAG,
+               "Pairing advertisement: name=%s address=%s rssi=%d services=%s "
+               "connectable=%d scannable=%d",
+               name.c_str(), mac.c_str(), advertisedDevice->getRSSI(),
+               services.c_str(), advertisedDevice->isConnectable(),
+               advertisedDevice->isScannable());
+    }
 
     if (mgr_->isDeviceKnown(mac)) {
-      ESP_LOGI(TAG, "Rejected advertisement %s: device already paired", mac.c_str());
+      if (isNewAddr) {
+        ESP_LOGI(TAG, "Rejected advertisement %s: device already paired", mac.c_str());
+      }
       return;
     }
 
@@ -144,14 +148,19 @@ class PairingLocatorCallbacks : public NimBLEScanCallbacks {
     const S3XYDeviceProfile* profile =
         mgr_->matchProfile(advertisedDevice, &profIdx);
     if (!profile) {
-      ESP_LOGW(TAG, "Rejected ENH_* device %s: no name/service profile matched",
-               mac.c_str());
+      if (isNewAddr) {
+        ESP_LOGW(TAG, "Rejected ENH_* device %s: no name/service profile matched",
+                 mac.c_str());
+      }
       return;
     }
+
+    if (found_) return;
 
     ESP_LOGI(TAG, "*** Pairing candidate: %s (%s), profile=%s ***",
              name.c_str(), mac.c_str(), profile->typeName);
 
+    delete foundDevice_;
     foundDevice_ = new NimBLEAdvertisedDevice(*advertisedDevice);
     foundMac_ = mac;
     foundName_ = name;
@@ -162,6 +171,7 @@ class PairingLocatorCallbacks : public NimBLEScanCallbacks {
 
   ~PairingLocatorCallbacks() override {
     delete foundDevice_;
+    foundDevice_ = nullptr;
   }
 
   bool found() const { return found_; }
@@ -543,7 +553,7 @@ bool S3XYDeviceManager::anyReady() const {
 }
 
 bool S3XYDeviceManager::allReady() const {
-  if (deviceCount_ == 0) return false;
+  // returns true even if deviceCount_ is 0
   return numReady() == deviceCount_;
 }
 
@@ -630,7 +640,7 @@ void S3XYDeviceManager::pairingScan() {
 
   PairingLocatorCallbacks callbacks(this);
   scan->setScanCallbacks(&callbacks);
-  scan->getResults(500, false);
+  scan->getResults(5000, false);
   scan->setScanCallbacks(nullptr);
   scan->clearResults();
 
@@ -818,6 +828,35 @@ void S3XYDeviceManager::unpair(size_t index) {
   tags_[deviceCount_] = nullptr;
   names_[deviceCount_] = nullptr;
 
+  // Re-save MACs and update tags to match their new indices in NVS
+  for (size_t i = index; i < deviceCount_; ++i) {
+    if (devices_[i] && !devices_[i]->mac().empty()) {
+      char newTag[8];
+      snprintf(newTag, sizeof(newTag), "dev_%u", (unsigned)i);
+      free(tags_[i]);
+      tags_[i] = strdup(newTag);
+      nvs_handle_t handle;
+      if (nvs_open("s3xy", NVS_READWRITE, &handle) == ESP_OK) {
+        char key[16];
+        snprintf(key, sizeof(key), "mac_%s", tags_[i]);
+        nvs_set_str(handle, key, devices_[i]->mac().c_str());
+        nvs_commit(handle);
+        nvs_close(handle);
+      }
+    }
+  }
+  // Clear the old last slot's MAC from NVS
+  {
+    nvs_handle_t handle;
+    if (nvs_open("s3xy", NVS_READWRITE, &handle) == ESP_OK) {
+      char key[16];
+      snprintf(key, sizeof(key), "mac_dev_%u", (unsigned)deviceCount_);
+      nvs_erase_key(handle, key);
+      nvs_commit(handle);
+      nvs_close(handle);
+    }
+  }
+
   saveDevices();
 }
 
@@ -870,12 +909,14 @@ void S3XYDeviceManager::loadDevices() {
     size_t nameLen = 0;
     char* nameBuf = nullptr;
     if (nvs_get_str(handle, nameKey, nullptr, &nameLen) == ESP_OK && nameLen > 0) {
-      nameBuf = new char[nameLen];
-      nvs_get_str(handle, nameKey, nameBuf, &nameLen);
+      nameBuf = static_cast<char*>(malloc(nameLen));
+      if (nameBuf) {
+        nvs_get_str(handle, nameKey, nameBuf, &nameLen);
+      }
     }
 
     if (profIdx >= profileCount_ || !nameBuf || nameLen == 0) {
-      delete[] nameBuf;
+      free(nameBuf);
       continue;
     }
 

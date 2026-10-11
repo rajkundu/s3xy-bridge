@@ -10,10 +10,12 @@
 #include <map>
 
 // ============================================================
-// Static notification dispatch
+// Static notification dispatch & concurrency locks
 // ============================================================
 
 static std::map<NimBLERemoteCharacteristic*, S3XYDevice*> s_notifyOwners;
+static portMUX_TYPE s_notifyMux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE s_deviceMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ============================================================
 // Utility
@@ -37,11 +39,15 @@ void S3XYDevice::notifyTrampoline(
     uint8_t* data,
     size_t length,
     bool isNotify) {
+  S3XYDevice* self = nullptr;
+  portENTER_CRITICAL(&s_notifyMux);
   auto it = s_notifyOwners.find(characteristic);
-  if (it == s_notifyOwners.end())
-    return;
+  if (it != s_notifyOwners.end()) {
+    self = it->second;
+  }
+  portEXIT_CRITICAL(&s_notifyMux);
 
-  S3XYDevice* self = it->second;
+  if (!self) return;
 
   printHex(self->tag_, data, length, isNotify);
 
@@ -86,8 +92,14 @@ class DeviceClientCallbacks : public NimBLEClientCallbacks {
     uint32_t elapsed = millis() - owner_->connectStartTime_;
     owner_->connectionPending_ = false;
     owner_->linkEstablished_ = false;
-    delete owner_->targetDevice_;
+
+    NimBLEAdvertisedDevice* targetToDel = nullptr;
+    portENTER_CRITICAL(&s_deviceMux);
+    targetToDel = owner_->targetDevice_;
     owner_->targetDevice_ = nullptr;
+    portEXIT_CRITICAL(&s_deviceMux);
+    delete targetToDel;
+
     owner_->nextScanTime_ = millis() + 500;
     ESP_LOGW(owner_->tag_,
              "Connection attempt timed out/failed after %lu ms, reason: %d (will resume scanning)",
@@ -126,11 +138,22 @@ class DeviceClientCallbacks : public NimBLEClientCallbacks {
     owner_->linkEstablished_ = false;
     owner_->notificationsSubscribed_ = false;
     owner_->service_ = nullptr;
-    owner_->notifyChar_ = nullptr;
+
+    if (owner_->notifyChar_) {
+      portENTER_CRITICAL(&s_notifyMux);
+      s_notifyOwners.erase(owner_->notifyChar_);
+      portEXIT_CRITICAL(&s_notifyMux);
+      owner_->notifyChar_ = nullptr;
+    }
     owner_->idChar_ = nullptr;
 
-    delete owner_->targetDevice_;
+    NimBLEAdvertisedDevice* targetToDel = nullptr;
+    portENTER_CRITICAL(&s_deviceMux);
+    targetToDel = owner_->targetDevice_;
     owner_->targetDevice_ = nullptr;
+    portEXIT_CRITICAL(&s_deviceMux);
+    delete targetToDel;
+
     owner_->nextScanTime_ = millis() + 100;
 
     S3XYDeviceManager* mgr = S3XYDeviceManager::instance();
@@ -159,8 +182,13 @@ S3XYDevice::S3XYDevice(const char* tag,
       idUUID_(idUUID) {}
 
 S3XYDevice::~S3XYDevice() {
-  delete targetDevice_;
+  NimBLEAdvertisedDevice* targetToDel = nullptr;
+  portENTER_CRITICAL(&s_deviceMux);
+  targetToDel = targetDevice_;
   targetDevice_ = nullptr;
+  portEXIT_CRITICAL(&s_deviceMux);
+  delete targetToDel;
+
   cleanupClient();
 }
 
@@ -170,9 +198,12 @@ S3XYDevice::~S3XYDevice() {
 
 void S3XYDevice::setTargetDevice(const NimBLEAdvertisedDevice& device) {
   NimBLEAdvertisedDevice* copy = new NimBLEAdvertisedDevice(device);
-  NimBLEAdvertisedDevice* old = targetDevice_;
+  NimBLEAdvertisedDevice* old = nullptr;
+  portENTER_CRITICAL(&s_deviceMux);
+  old = targetDevice_;
   targetDevice_ = copy;
   nextScanTime_ = 0;
+  portEXIT_CRITICAL(&s_deviceMux);
   delete old;
 }
 
@@ -195,13 +226,15 @@ void S3XYDevice::attachClient(NimBLEClient* client) {
 
 void S3XYDevice::cleanupClient() {
   if (notifyChar_) {
+    portENTER_CRITICAL(&s_notifyMux);
     s_notifyOwners.erase(notifyChar_);
+    portEXIT_CRITICAL(&s_notifyMux);
+    notifyChar_ = nullptr;
   }
 
   if (client_) {
     if (client_->isConnected()) {
       client_->disconnect();
-      delay_ms(50);
     }
 
     NimBLEDevice::deleteClient(client_);
@@ -256,8 +289,12 @@ void S3XYDevice::saveMac(const NimBLEAddress& address) {
 
 void S3XYDevice::clearSavedMac() {
   savedMac_ = "";
-  delete targetDevice_;
+  NimBLEAdvertisedDevice* targetToDel = nullptr;
+  portENTER_CRITICAL(&s_deviceMux);
+  targetToDel = targetDevice_;
   targetDevice_ = nullptr;
+  portEXIT_CRITICAL(&s_deviceMux);
+  delete targetToDel;
 
   nvs_handle_t handle;
   if (nvs_open("s3xy", NVS_READWRITE, &handle) == ESP_OK) {
@@ -280,12 +317,15 @@ bool S3XYDevice::connectToDevice() {
     connectionPending_ = false;
     ESP_LOGI(tag_, "GATT link ready; starting service discovery");
   } else {
-    if (!targetDevice_) {
+    NimBLEAdvertisedDevice* device = nullptr;
+    portENTER_CRITICAL(&s_deviceMux);
+    device = targetDevice_;
+    targetDevice_ = nullptr;
+    portEXIT_CRITICAL(&s_deviceMux);
+
+    if (!device) {
       return false;
     }
-
-    NimBLEAdvertisedDevice* device = targetDevice_;
-    targetDevice_ = nullptr;
 
     cleanupClient();
 
@@ -340,8 +380,8 @@ bool S3XYDevice::connectToDevice() {
   service_ = client_->getService(NimBLEUUID(serviceUUID_));
   ESP_LOGI(tag_, "service discovery took %lu ms", millis() - stageStartedAt);
 
-  if (!service_) {
-    ESP_LOGI(tag_, "ERROR: Service not found");
+  if (!service_ || !client_->isConnected()) {
+    ESP_LOGI(tag_, "ERROR: Service not found or disconnected");
 
     client_->disconnect();
     cleanupClient();
@@ -356,13 +396,20 @@ bool S3XYDevice::connectToDevice() {
 
   stageStartedAt = millis();
   service_->getCharacteristics(true);
+  if (!client_ || !client_->isConnected() || !service_) {
+    ESP_LOGW(tag_, "Disconnected during characteristic discovery");
+    cleanupClient();
+    return false;
+  }
   notifyChar_ = service_->getCharacteristic(NimBLEUUID(notifyUUID_));
   ESP_LOGI(tag_, "characteristic discovery took %lu ms", millis() - stageStartedAt);
 
   if (!notifyChar_) {
     ESP_LOGI(tag_, "ERROR: Notify characteristic not found");
 
-    client_->disconnect();
+    if (client_ && client_->isConnected()) {
+      client_->disconnect();
+    }
     cleanupClient();
     return false;
   }
@@ -378,20 +425,31 @@ bool S3XYDevice::connectToDevice() {
   if (!notifyChar_->canNotify()) {
     ESP_LOGI(tag_, "ERROR: Characteristic does not advertise NOTIFY");
 
-    client_->disconnect();
+    if (client_ && client_->isConnected()) {
+      client_->disconnect();
+    }
     cleanupClient();
     return false;
   }
 
   ESP_LOGI(tag_, "Registering for notifications...");
 
+  portENTER_CRITICAL(&s_notifyMux);
   s_notifyOwners[notifyChar_] = this;
+  portEXIT_CRITICAL(&s_notifyMux);
 
   stageStartedAt = millis();
-  notifyChar_->subscribe(true, notifyTrampoline, true);
-  ESP_LOGI(tag_, "notification registration took %lu ms", millis() - stageStartedAt);
-  notificationsSubscribed_ = true;
+  bool subOk = notifyChar_->subscribe(true, notifyTrampoline, true);
+  ESP_LOGI(tag_, "notification registration took %lu ms (ok=%d)",
+           millis() - stageStartedAt, subOk);
 
+  if (!subOk || !client_ || !client_->isConnected() || !service_) {
+    ESP_LOGW(tag_, "Notification subscription failed or device disconnected");
+    cleanupClient();
+    return false;
+  }
+
+  notificationsSubscribed_ = true;
   ESP_LOGI(tag_, "Notification subscription registered");
 
   // ----------------------------------------------------------
@@ -406,7 +464,15 @@ bool S3XYDevice::connectToDevice() {
       (!idChar_->canWrite() && !idChar_->canWriteNoResponse())) {
     ESP_LOGI(tag_, "ERROR: ID characteristic is not writable");
 
-    client_->disconnect();
+    if (client_ && client_->isConnected()) {
+      client_->disconnect();
+    }
+    cleanupClient();
+    return false;
+  }
+
+  if (!client_ || !client_->isConnected()) {
+    ESP_LOGW(tag_, "Device disconnected before completing connection");
     cleanupClient();
     return false;
   }

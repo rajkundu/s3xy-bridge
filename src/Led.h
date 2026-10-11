@@ -7,6 +7,9 @@
 #include <esp_timer.h>
 #include "compat.h"
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+
 struct LedState {
   unsigned long timestamp;
   bool on;
@@ -18,6 +21,7 @@ class Led {
  public:
   explicit Led(gpio_num_t pin, bool activeLow = false,
                bool addressable = false);
+  ~Led();
   void begin();
   void runLed(const LedPattern& pattern, unsigned long cycleDuration);
   void set(bool on);
@@ -29,6 +33,7 @@ class Led {
 
   static void timer_callback(void* arg);
   void update();
+  void updateInternal();
   void finishPattern();
   void write(bool on);
   void writeAddressable(bool on);
@@ -49,4 +54,5 @@ class Led {
   unsigned long repeatingCycleDuration_ = 0;
   bool running_ = false;
   esp_timer_handle_t ticker_ = nullptr;
+  SemaphoreHandle_t mutex_ = nullptr;
 };

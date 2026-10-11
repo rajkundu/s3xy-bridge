@@ -42,7 +42,21 @@ static size_t encodeWs2812(const void* data, size_t dataSize,
 }  // namespace
 
 Led::Led(gpio_num_t pin, bool activeLow, bool addressable)
-    : pin_(pin), activeLow_(activeLow), addressable_(addressable) {}
+    : pin_(pin), activeLow_(activeLow), addressable_(addressable) {
+  mutex_ = xSemaphoreCreateMutex();
+}
+
+Led::~Led() {
+  if (ticker_) {
+    esp_timer_stop(ticker_);
+    esp_timer_delete(ticker_);
+    ticker_ = nullptr;
+  }
+  if (mutex_) {
+    vSemaphoreDelete(mutex_);
+    mutex_ = nullptr;
+  }
+}
 
 void Led::begin() {
   if (addressable_) {
@@ -73,61 +87,46 @@ void Led::begin() {
       return;
     }
 
-    ESP_LOGI(TAG, "started addressable LED on GPIO %d", pin_);
-    write(true);
+    writeAddressable(false);
   } else {
     gpio_config_t io_conf = {};
     io_conf.intr_type = GPIO_INTR_DISABLE;
     io_conf.mode = GPIO_MODE_OUTPUT;
     io_conf.pin_bit_mask = (1ULL << pin_);
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    esp_err_t gpioResult = gpio_config(&io_conf);
-    if (gpioResult != ESP_OK) {
-      ESP_LOGE(TAG, "gpio_config(%d) failed: %s", pin_,
-               esp_err_to_name(gpioResult));
-      return;
-    }
-
-    set(false);
+    gpio_config(&io_conf);
+    write(false);
   }
 
-  esp_timer_create_args_t timer_args = {};
-  timer_args.callback = &Led::timer_callback;
-  timer_args.arg = this;
-  timer_args.name = "led_timer";
-  esp_err_t timerResult = esp_timer_create(&timer_args, &ticker_);
-  if (timerResult != ESP_OK) {
-    ESP_LOGE(TAG, "esp_timer_create failed: %s", esp_err_to_name(timerResult));
+  esp_timer_create_args_t timerArgs = {};
+  timerArgs.callback = &Led::timer_callback;
+  timerArgs.arg = this;
+  timerArgs.name = "led_ticker";
+  esp_err_t result = esp_timer_create(&timerArgs, &ticker_);
+  if (result != ESP_OK) {
+    ESP_LOGE(TAG, "esp_timer_create failed: %s", esp_err_to_name(result));
     return;
   }
 
-  timerResult = esp_timer_start_periodic(ticker_, UPDATE_INTERVAL_MS * 1000);
-  if (timerResult != ESP_OK) {
+  result = esp_timer_start_periodic(ticker_, UPDATE_INTERVAL_MS * 1000);
+  if (result != ESP_OK) {
     ESP_LOGE(TAG, "esp_timer_start_periodic failed: %s",
-             esp_err_to_name(timerResult));
-    return;
-  }
-
-  ESP_LOGI(TAG, "started LED on GPIO %d (%s)", pin_,
-           addressable_ ? "addressable" :
-           (activeLow_ ? "active-low" : "active-high"));
-
-  if (LED_DEBUG) {
-    ESP_LOGD(TAG, "started on pin %d", pin_);
+             esp_err_to_name(result));
   }
 }
 
 void Led::timer_callback(void* arg) {
-  Led* led = static_cast<Led*>(arg);
-  led->update();
+  static_cast<Led*>(arg)->update();
 }
 
 void Led::runLed(const LedPattern& pattern, unsigned long cycleDuration) {
   if (pattern.size() == 0) {
     if (LED_DEBUG) {
-      ESP_LOGD(TAG, "ignored empty pattern");
+      ESP_LOGD(TAG, "pattern has no states; ignoring");
     }
+    return;
+  }
+
+  if (mutex_ && xSemaphoreTake(mutex_, pdMS_TO_TICKS(50)) != pdTRUE) {
     return;
   }
 
@@ -146,6 +145,7 @@ void Led::runLed(const LedPattern& pattern, unsigned long cycleDuration) {
   }
 
   if (samePattern) {
+    if (mutex_) xSemaphoreGive(mutex_);
     return;
   }
 
@@ -164,10 +164,14 @@ void Led::runLed(const LedPattern& pattern, unsigned long cycleDuration) {
     ESP_LOGD(TAG, "starting pattern (%u states, cycle %lu ms)",
              static_cast<unsigned>(pattern.size()), cycleDuration);
   }
-  update();
+  updateInternal();
+  if (mutex_) xSemaphoreGive(mutex_);
 }
 
 void Led::set(bool on) {
+  if (mutex_ && xSemaphoreTake(mutex_, pdMS_TO_TICKS(50)) != pdTRUE) {
+    return;
+  }
   running_ = false;
   repeatingCycleDuration_ = 0;
   repeatingStates_.clear();
@@ -175,6 +179,7 @@ void Led::set(bool on) {
     ESP_LOGD(TAG, "set %s", on ? "on" : "off");
   }
   write(on);
+  if (mutex_) xSemaphoreGive(mutex_);
 }
 
 bool Led::isRunning() const {
@@ -186,6 +191,18 @@ bool Led::isRepeating() const {
 }
 
 void Led::update() {
+  if (!running_) {
+    return;
+  }
+
+  if (mutex_ && xSemaphoreTake(mutex_, pdMS_TO_TICKS(20)) != pdTRUE) {
+    return;
+  }
+  updateInternal();
+  if (mutex_) xSemaphoreGive(mutex_);
+}
+
+void Led::updateInternal() {
   if (!running_) {
     return;
   }
@@ -245,7 +262,7 @@ void Led::finishPattern() {
     if (LED_DEBUG) {
       ESP_LOGD(TAG, "reinstating repeating pattern");
     }
-    update();
+    updateInternal();
     return;
   }
 
@@ -273,14 +290,18 @@ void Led::writeAddressable(bool on) {
   hasAddressableState_ = true;
   lastAddressableState_ = on;
 
-  // This board's onboard pixel responds as RGB. Use dim white for on.
-  uint8_t pixel[3] = {static_cast<uint8_t>(on ? 16 : 0),
-                      static_cast<uint8_t>(on ? 16 : 0),
-                      static_cast<uint8_t>(on ? 16 : 0)};
-  rmt_transmit_config_t transmitConfig = {};
-  esp_err_t result = rmt_transmit(rmtChannel_, rmtEncoder_, pixel,
-                                  sizeof(pixel), &transmitConfig);
-  if (result != ESP_OK) {
-    ESP_LOGE(TAG, "addressable LED write failed: %s", esp_err_to_name(result));
+  if (rmtChannel_) {
+    rmt_tx_wait_all_done(rmtChannel_, 50);
+
+    // This board's onboard pixel responds as RGB. Use dim white for on.
+    uint8_t pixel[3] = {static_cast<uint8_t>(on ? 16 : 0),
+                        static_cast<uint8_t>(on ? 16 : 0),
+                        static_cast<uint8_t>(on ? 16 : 0)};
+    rmt_transmit_config_t transmitConfig = {};
+    esp_err_t result = rmt_transmit(rmtChannel_, rmtEncoder_, pixel,
+                                    sizeof(pixel), &transmitConfig);
+    if (result != ESP_OK) {
+      ESP_LOGE(TAG, "addressable LED write failed: %s", esp_err_to_name(result));
+    }
   }
 }
