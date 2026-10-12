@@ -19,6 +19,11 @@ static constexpr gpio_num_t LED_PIN = GPIO_NUM_8;
 
 Led led(LED_PIN, false, true);
 
+static constexpr uint32_t STALK_HOLD_THRESHOLD_MS = 750;
+static uint32_t lastPressedEndCap = 0;
+static uint32_t lastPressedDown = 0;
+static uint32_t lastPressedUp = 0;
+
 // ----- Notification callbacks -----
 
 static void onStalkNotify(S3XYDevice& device, const uint8_t* data, size_t len) {
@@ -34,17 +39,54 @@ static void onStalkNotify(S3XYDevice& device, const uint8_t* data, size_t len) {
            stalkEventToString(packet.event),
            (unsigned long)packet.timestamp);
 
-  // Forward interpreted actions to virtual button (temporary until CAN bus integration)
-  if (s3xy_ready()) {
-    if (packet.event == StalkEvent::Action_Single) {
-      s3xy_send_single();
-      ESP_LOGI(TAG, "Forwarded single press from %s", device.tag());
-    } else if (packet.event == StalkEvent::Action_Double) {
-      s3xy_send_double();
-      ESP_LOGI(TAG, "Forwarded double press from %s", device.tag());
-    } else if (packet.event == StalkEvent::Action_Long) {
-      s3xy_send_long();
-      ESP_LOGI(TAG, "Forwarded long press from %s", device.tag());
+  // 1) Handle press events
+  if (packet.event == StalkEvent::Press) {
+    if (packet.sw == StalkSwitch::EndCap) {
+      lastPressedEndCap = packet.timestamp;
+      if (s3xy_ready()) {
+        s3xy_send_single();
+        ESP_LOGI(TAG, "Sent virtual single press (end cap)");
+      }
+    } else if (packet.sw == StalkSwitch::Down) {
+      lastPressedDown = packet.timestamp;
+      if (s3xy_ready()) {
+        s3xy_send_double();
+        ESP_LOGI(TAG, "Sent virtual double press (stalk down)");
+      }
+    } else if (packet.sw == StalkSwitch::Up) {
+      lastPressedUp = packet.timestamp;
+      if (s3xy_ready()) {
+        s3xy_send_long();
+        ESP_LOGI(TAG, "Sent virtual long press (stalk up)");
+      }
+    }
+    // Flash the LED upon press (off for 200 ms, no repeat)
+    led.runLed({{0, false}, {200, true}}, 0);
+  }
+  // 2) Handle release events for stalk up / stalk down
+  else if (packet.event == StalkEvent::Release) {
+    if (packet.sw == StalkSwitch::Down) {
+      uint32_t pressedAt = lastPressedDown;
+      lastPressedDown = 0; // Cleared immediately regardless of outcome
+      if (pressedAt == 0 || (packet.timestamp - pressedAt < STALK_HOLD_THRESHOLD_MS)) {
+        return;
+      }
+      if (s3xy_ready()) {
+        s3xy_send_double();
+        ESP_LOGI(TAG, "Sent virtual double press on release (stalk down)");
+      }
+    } else if (packet.sw == StalkSwitch::Up) {
+      uint32_t pressedAt = lastPressedUp;
+      lastPressedUp = 0; // Cleared immediately regardless of outcome
+      if (pressedAt == 0 || (packet.timestamp - pressedAt < STALK_HOLD_THRESHOLD_MS)) {
+        return;
+      }
+      if (s3xy_ready()) {
+        s3xy_send_long();
+        ESP_LOGI(TAG, "Sent virtual long press on release (stalk up)");
+      }
+    } else if (packet.sw == StalkSwitch::EndCap) {
+      lastPressedEndCap = 0;
     }
   }
 }
@@ -108,18 +150,17 @@ static void updateLed() {
   }
 
   if (manager.isPairing()) {
-    // Fast blink — pairing mode
-    led.runLed({{0, true}, {100, false}}, 1000);
-  } else if (manager.deviceCount() == 0) {
-    // Solid OFF — no devices paired
-    led.set(false);
+    // Blink — pairing mode
+    led.runLed({{0, true}, {500, false}}, 1000);
   } else if (manager.allReady() && s3xy_ready()) {
     // Solid ON — everything connected, INCLUDING Commander (virtual button)
     led.set(true);
+  } else if (manager.allReady() && !s3xy_ready()) {
+    // Single-blink — S3xy peripherals connected but not Commander (virtual button)
+    led.runLed({{0, true}, {100, false}}, 1000);
   } else {
-    // Slow double-blink — not all ready
-    led.runLed({{0, true}, {100, false},
-                {200, true}, {300, false}}, 1000);
+    // Double-blink — not all ready
+    led.runLed({{0, true}, {100, false}, {200, true}, {300, false}}, 1000);
   }
 }
 
