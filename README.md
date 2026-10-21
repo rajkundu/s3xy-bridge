@@ -40,6 +40,9 @@ The following was derived from playing around with nRF Connect on an iPhone and 
 - Double Press: 0xA2C102
 - Long Press: 0xA2C301
 
+## `esp-nimble-cpp` patch
+Note: `/esp-nimble-whitelist.patch` allows connection to any of multiple whitelisted MACs - something not (currently) supported by h2zero/esp-nimble-cpp. Since this is such a small change, I didn't want to fork esp-nimble-cpp. Applying the patch to the submodule is handled automatically by CMakeLists.txt.
+
 ## Note
 I would NOT consider this code production-quality. It is somewhat modular, but many improvements can be made to make it more abstracted & object-oriented.
 
