@@ -1,0 +1,43 @@
+# S3XY Bridge sdkconfig overrides.
+# Applied on top of IDF defaults when PlatformIO regenerates the per-env
+# sdkconfig. Keep this file minimal — only values we want to lock in.
+
+# Route console to USB-Serial-JTAG (ESP32-C6-SuperMini has no UART0 breakout)
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# CONFIG_ESP_CONSOLE_UART_DEFAULT is not set
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# Flash
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# BLE (NimBLE — the only stack supported on ESP32-C6)
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=4
+CONFIG_BT_NIMBLE_MAX_BONDS=5
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+# CONFIG_BT_NIMBLE_SM_LEGACY is not set
+
+# Controller: activities = connections + advertising + scanning
+# 4 connections + 1 advertising + 1 scanning = 6
+CONFIG_BT_CTRL_BLE_MAX_ACT=6
+
+# NimBLE host task stack (callbacks do GATT discovery, need room)
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192
+
+# NimBLE log level
+CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
+
+# NVS
+CONFIG_NVS_ENABLED=y
+
+# Logging — compile all levels, default to INFO
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y
+
+# Main task needs enough stack for BLE + NVS
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

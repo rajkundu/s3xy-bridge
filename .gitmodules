@@ -1,0 +1,4 @@
+[submodule "components/esp-nimble-cpp"]
+	path = components/esp-nimble-cpp
+	url = https://github.com/h2zero/esp-nimble-cpp.git
+    ignore = dirty
