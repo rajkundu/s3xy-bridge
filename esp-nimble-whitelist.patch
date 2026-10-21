@@ -1,0 +1,48 @@
+diff --git a/src/NimBLEClient.cpp b/src/NimBLEClient.cpp
+--- a/src/NimBLEClient.cpp
++++ b/src/NimBLEClient.cpp
+@@ -249,8 +249,8 @@ int NimBLEClient::startConnectionAttempt(const ble_addr_t* peerAddr) {
+ bool NimBLEClient::connect(const NimBLEAddress& address, bool deleteAttributes, bool asyncConnect, bool exchangeMTU) {
+     NIMBLE_LOGD(LOG_TAG, ">> connect(%s)", address.toString().c_str());
+     NimBLEUtils::TaskData taskData(this);
+-    const ble_addr_t*     peerAddr = address.getBase();
+-    int                   rc       = 0;
++    const ble_addr_t* peerAddr = address.isNull() ? nullptr : address.getBase();
++    int               rc       = 0;
+
+     if (!NimBLEDevice::m_synced) {
+         NIMBLE_LOGE(LOG_TAG, "Host not synced with controller.");
+@@ -264,12 +264,6 @@ bool NimBLEClient::connect(const NimBLEAddress& address, bool deleteAttributes,
+         goto error;
+     }
+
+-    if (address.isNull()) {
+-        NIMBLE_LOGE(LOG_TAG, "Invalid peer address; (NULL)");
+-        rc = BLE_HS_EINVAL;
+-        goto error;
+-    }
+-
+     m_connStatus             = CONNECTING;
+     m_peerAddress            = address;
+     m_config.asyncConnect    = asyncConnect;
+@@ -1122,6 +1116,7 @@ int NimBLEClient::handleGapEvent(struct ble_gap_event* event, void* arg) {
+
+                 ble_gap_conn_desc desc;
+                 if (ble_gap_conn_find(event->connect.conn_handle, &desc) == 0) {
++                    pClient->m_peerAddress = NimBLEAddress(desc.peer_ota_addr);
+                     pClient->startConnectEstablishedTimer(desc.conn_itvl);
+                 } else {
+                     pClient->startConnectEstablishedTimer(pClient->m_connParams.itvl_max);
+diff --git a/src/NimBLEDevice.cpp b/src/NimBLEDevice.cpp
+--- a/src/NimBLEDevice.cpp
++++ b/src/NimBLEDevice.cpp
+@@ -745,7 +745,8 @@ bool NimBLEDevice::whiteListRemove(const NimBLEAddress& address) {
+     for (auto it = m_whiteList.begin(); it < m_whiteList.end(); ++it) {
+         if (*it == address) {
+             m_whiteList.erase(it);
+-            int rc = ble_gap_wl_set(reinterpret_cast<ble_addr_t*>(m_whiteList.data()), m_whiteList.size());
++            ble_addr_t* addrs = m_whiteList.empty() ? nullptr : reinterpret_cast<ble_addr_t*>(m_whiteList.data());
++            int rc = ble_gap_wl_set(addrs, m_whiteList.size());
+             if (rc != 0) {
+                 m_whiteList.push_back(address);
+                 NIMBLE_LOGE(LOG_TAG, "Failed removing from whitelist rc=%d", rc);
